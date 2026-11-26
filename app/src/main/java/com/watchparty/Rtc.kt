@@ -40,7 +40,7 @@ class Rtc(
     private var helper: SurfaceTextureHelper? = null
     private var rec: AudioRecord? = null
     private var vTrack: VideoTrack? = null
-    private var aTrack: AudioTrack? = null
+    private var aTrack: org.webrtc.AudioTrack? = null
 
     private val factory: PeerConnectionFactory by lazy {
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(ctx).createInitializationOptions())
