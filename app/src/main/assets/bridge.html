@@ -1,0 +1,53 @@
+<!doctype html>
+<html><head><meta charset="utf-8"></head><body>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>if (!window.supabase) document.write('<script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"><\/script>');</script>
+<script>
+var SB_URL = 'https://dtrihjdxpwpahhpozxlo.supabase.co';
+var SB_KEY = 'sb_publishable_Nc3Ce_vjJnB03BOMGQIydQ_8oJwRmtw';
+var client = null, ch = null;
+
+function status(s) { try { Android.onStatus(String(s)); } catch (e) {} }
+
+function coJoin(room, myId, name) {
+  if (!window.supabase) { status('error:no-lib'); return; }
+  coLeave();
+  if (!client) {
+    client = window.supabase.createClient(SB_URL, SB_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+      realtime: { params: { eventsPerSecond: 20 } }
+    });
+  }
+  ch = client.channel('cbapp-' + room, { config: { broadcast: { self: false, ack: false }, presence: { key: myId } } });
+  ch.on('broadcast', { event: 'm' }, function (p) {
+    try { Android.onMessage(JSON.stringify(p.payload)); } catch (e) {}
+  });
+  ch.on('presence', { event: 'sync' }, function () {
+    var st = ch.presenceState(), list = [];
+    Object.keys(st).forEach(function (k) {
+      var arr = st[k];
+      if (arr && arr[0]) list.push({ id: k, name: arr[0].name || '' });
+    });
+    try { Android.onPeople(JSON.stringify(list)); } catch (e) {}
+  });
+  ch.subscribe(function (s) {
+    if (s === 'SUBSCRIBED') {
+      try { ch.track({ name: name, at: Date.now() }); } catch (e) {}
+      try { Android.onReady(); } catch (e) {}
+    } else {
+      status(s);
+    }
+  });
+}
+
+function coSend(json) {
+  if (!ch) return;
+  try { ch.send({ type: 'broadcast', event: 'm', payload: JSON.parse(json) }); } catch (e) {}
+}
+
+function coLeave() {
+  if (ch && client) { try { client.removeChannel(ch); } catch (e) {} }
+  ch = null;
+}
+</script>
+</body></html>
