@@ -6,17 +6,24 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Outline
+import android.graphics.Paint
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.util.Base64
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.webkit.CookieManager
@@ -37,6 +44,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.URL
 import java.util.Locale
 import kotlin.concurrent.thread
@@ -60,7 +68,6 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private lateinit var web: WebView
     private lateinit var pickerScroll: View
     private lateinit var chatPanel: LinearLayout
-    private lateinit var chatLog: TextView
     private lateinit var chatScroll: ScrollView
     private lateinit var roomLabel: TextView
     private lateinit var starBtn: TextView
@@ -84,10 +91,33 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private var mediaPlaying = false
     private var mediaTime = 0.0
     private var mediaAt = 0L
-    private var lastActorMe = false
     private var peopleCount = 0
     private var connStatus = "подключение…"
     private var pendingCmd: Triple<String, Double, Long>? = null
+
+    // --- права и участники ---
+    private var hostId = ""
+    private var controllerId = ""
+    private var controllerSeen = false
+    private var mediaKnown = false
+    private var lastToastAt = 0L
+    private val peopleIds = ArrayList<String>()
+    private val peopleNames = HashMap<String, String>()
+
+    // --- аватары ---
+    private val avatars = HashMap<String, Bitmap>()
+    private val letterCache = HashMap<String, Bitmap>()
+    private var myAvatar: Bitmap? = null
+    private var myAvatarB64: String? = null
+    private lateinit var homeAvatar: ImageView
+    private lateinit var chatBox: LinearLayout
+    private var membersDialog: AlertDialog? = null
+
+    // --- зеркалирование экрана ---
+    private lateinit var pinBtn: TextView
+    private lateinit var shield: View
+    private var mirrorLock = true
+    private var lastScroll = -1.0
 
     // --- скрипты ---
     private var syncJs = ""
@@ -114,6 +144,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
             prefs.edit().putString("uid", myId).apply()
         }
         myName = prefs.getString("name", "") ?: ""
+        loadMyAvatar()
 
         buildUi()
         bridge = SyncBridge(this, this)
@@ -233,9 +264,22 @@ class MainActivity : Activity(), SyncBridge.Callback {
         sub.textSize = 15f
         col.addView(sub, lp(4))
 
+        homeAvatar = ImageView(this)
+        circle(homeAvatar)
+        homeAvatar.setOnClickListener { pickAvatar() }
+        val hap = LinearLayout.LayoutParams(dp(96), dp(96))
+        hap.topMargin = dp(28)
+        col.addView(homeAvatar, hap)
+
+        val cap = TextView(this)
+        cap.text = "Нажми на круг, чтобы выбрать свой аватар"
+        cap.setTextColor(0xFF9A9AB0.toInt())
+        cap.textSize = 13f
+        col.addView(cap, lp(6))
+
         nameInput = input("Твоё имя")
         nameInput.setText(myName)
-        col.addView(nameInput, lp(32))
+        col.addView(nameInput, lp(16))
 
         col.addView(button("Создать комнату", ACCENT) { createRoom() }, lp(16))
 
@@ -266,7 +310,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
         bar.setPadding(dp(4), 0, dp(4), 0)
 
         bar.addView(iconBtn("⌂") { showPicker() })
-        bar.addView(iconBtn("📍") { pushNavToAll() })
+        pinBtn = iconBtn("📍") { onPinClick() }
+        bar.addView(pinBtn)
         starBtn = iconBtn("☆") { toggleFavorite() }
         bar.addView(starBtn)
 
@@ -279,7 +324,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
         chatBtn = iconBtn("💬") { toggleChat() }
         bar.addView(chatBtn)
-        bar.addView(iconBtn("↗") { shareCode() })
+        bar.addView(iconBtn("👥") { showMembers() })
         bar.addView(iconBtn("✕") { confirmLeave() })
         col.addView(bar, LinearLayout.LayoutParams(MATCH, dp(48)))
 
@@ -290,6 +335,11 @@ class MainActivity : Activity(), SyncBridge.Callback {
         web = createWebView()
         web.visibility = View.GONE
         content.addView(web, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        shield = View(this)
+        shield.setOnTouchListener { _, _ -> true }
+        shield.visibility = View.GONE
+        content.addView(shield, FrameLayout.LayoutParams(MATCH, MATCH))
 
         chatPanel = buildChat()
         chatPanel.visibility = View.GONE
@@ -306,10 +356,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
         box.setPadding(dp(10), dp(8), dp(10), dp(8))
 
         chatScroll = ScrollView(this)
-        chatLog = TextView(this)
-        chatLog.setTextColor(Color.WHITE)
-        chatLog.textSize = 14f
-        chatScroll.addView(chatLog)
+        chatBox = LinearLayout(this)
+        chatBox.orientation = LinearLayout.VERTICAL
+        chatScroll.addView(chatBox)
         box.addView(chatScroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
         val row = LinearLayout(this)
@@ -321,7 +370,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
             val text = et.text.toString().trim()
             if (text.isNotEmpty()) {
                 et.setText("")
-                addChat(myName, text)
+                addChat(myId, myName, text)
                 sendMsg(JSONObject().put("t", "chat").put("text", text))
             }
         }
@@ -474,7 +523,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 if (roomCode != null) prefs.edit().putString("last_url_" + roomCode, url).apply()
                 if (url == suppressedUrl) return
                 suppressedUrl = null
-                if (isHost && !isReload && url != lastSentUrl) {
+                if (amController() && !isReload && url != lastSentUrl) {
                     navTask?.let { handler.removeCallbacks(it) }
                     val task = Runnable { sendNav(url, false) }
                     navTask = task
@@ -485,7 +534,12 @@ class MainActivity : Activity(), SyncBridge.Callback {
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (!docStartOk) view?.evaluateJavascript(syncJs, null)
                 updateStar()
+                runRole()
                 runPending()
+                if (!amController() && lastScroll >= 0) {
+                    applyScroll()
+                    handler.postDelayed({ applyScroll() }, 1200)
+                }
             }
         }
 
@@ -580,6 +634,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         roomLayout.visibility = View.GONE
         homeLayout.visibility = View.VISIBLE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        bindAvatar(homeAvatar, myId, if (myName.isBlank()) "?" else myName)
         val last = prefs.getString("last_room", null)
         val ts = prefs.getLong("last_ts", 0L)
         if (last != null && System.currentTimeMillis() - ts < 12L * 3600 * 1000) {
@@ -593,11 +648,73 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private fun showPicker() {
         pickerScroll.visibility = View.VISIBLE
         web.visibility = View.GONE
+        updateShield()
     }
 
     private fun showWeb() {
         pickerScroll.visibility = View.GONE
         web.visibility = View.VISIBLE
+        updateShield()
+    }
+
+    // Следящий видит экран управляющего и не может случайно «сломать» страницу своими нажатиями.
+    private fun updateShield() {
+        val on = roomCode != null && !amController() && mirrorLock && web.visibility == View.VISIBLE
+        shield.visibility = if (on) View.VISIBLE else View.GONE
+        pinBtn.text = if (amController()) "📍" else if (mirrorLock) "🔒" else "🔓"
+    }
+
+    private fun runRole() {
+        if (roomCode != null) web.evaluateJavascript("window.__coCtl=" + amController(), null)
+    }
+
+    private fun onPinClick() {
+        if (amController()) {
+            pushNavToAll()
+            return
+        }
+        mirrorLock = !mirrorLock
+        updateShield()
+        Toast.makeText(
+            this,
+            if (mirrorLock) "Режим «смотрим вместе»: экран повторяет действия управляющего"
+            else "Свободный режим: можешь сам листать и нажимать",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun applyScroll() {
+        if (lastScroll < 0 || amController()) return
+        web.evaluateJavascript(
+            "window.__coUi&&window.__coUi({e:'scroll',y:" + String.format(Locale.US, "%.4f", lastScroll) + "})", null
+        )
+    }
+
+    private fun cleanUi(o: JSONObject): JSONObject? {
+        val e = o.optString("e")
+        val out = JSONObject().put("e", e)
+        when (e) {
+            "scroll" -> out.put("y", o.optDouble("y", 0.0).coerceIn(0.0, 1.0))
+            "click" -> {
+                out.put("sel", o.optString("sel").take(400))
+                out.put("nx", o.optDouble("nx", 0.5).coerceIn(0.0, 1.0))
+                out.put("ny", o.optDouble("ny", 0.5).coerceIn(0.0, 1.0))
+            }
+            "input" -> {
+                out.put("sel", o.optString("sel").take(400))
+                out.put("val", o.optString("val").take(500))
+            }
+            else -> return null
+        }
+        return out
+    }
+
+    private fun onLocalUi(o: JSONObject) {
+        if (!amController() || roomCode == null) return
+        val c = cleanUi(o) ?: return
+        if (c.optString("e") == "scroll") lastScroll = c.optDouble("y", 0.0)
+        c.put("t", "ui")
+        sendMsg(c)
     }
 
     private fun saveName(): Boolean {
@@ -644,11 +761,15 @@ class MainActivity : Activity(), SyncBridge.Callback {
         suppressedUrl = null
         mediaPlaying = false
         mediaTime = 0.0
-        lastActorMe = false
         pendingCmd = null
+        mediaKnown = false
+        controllerSeen = false
+        hostId = if (host) myId else ""
+        controllerId = if (host) myId else ""
+        peopleIds.clear()
         peopleCount = 1
         connStatus = "подключение…"
-        chatLog.text = ""
+        chatBox.removeAllViews()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         prefs.edit().putString("last_room", code).putBoolean("last_host", host)
             .putLong("last_ts", System.currentTimeMillis()).apply()
@@ -689,7 +810,10 @@ class MainActivity : Activity(), SyncBridge.Callback {
     }
 
     private fun updateRoomLabel() {
-        roomLabel.text = "${roomCode ?: ""} · 👥$peopleCount\n$connStatus"
+        val crown = if (controllerId.isNotEmpty()) " · 👑" + nameOf(controllerId) else ""
+        roomLabel.text = "${roomCode ?: ""} · 👥$peopleCount\n$connStatus$crown"
+        updateShield()
+        runRole()
     }
 
     private fun shareCode() {
@@ -768,7 +892,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         showWeb()
         if (url == currentUrl && web.url == url) return
         web.loadUrl(url)
-        if (isHost) sendNav(url, false)
+        if (amController()) sendNav(url, false)
     }
 
     private fun openRemote(url: String) {
@@ -786,11 +910,17 @@ class MainActivity : Activity(), SyncBridge.Callback {
         lastSentUrl = url
         mediaPlaying = false
         mediaTime = 0.0
+        mediaKnown = false
+        lastScroll = -1.0
         mediaAt = System.currentTimeMillis()
         sendMsg(JSONObject().put("t", "nav").put("url", url).put("force", force))
     }
 
     private fun pushNavToAll() {
+        if (!amController()) {
+            Toast.makeText(this, "Страницу для всех меняет тот, у кого управление: " + nameOf(controllerId), Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!currentUrl.startsWith("http")) {
             Toast.makeText(this, "Сначала открой сайт", Toast.LENGTH_SHORT).show()
             return
@@ -806,33 +936,66 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private fun currentMediaTime(): Double =
         if (mediaPlaying) mediaTime + (now() - mediaAt) / 1000.0 else mediaTime
 
+    private fun amController(): Boolean = controllerId.isNotEmpty() && controllerId == myId
+
+    private fun amHost(): Boolean = hostId.isNotEmpty() && hostId == myId
+
+    private fun nameOf(id: String): String {
+        if (id == myId) return if (myName.isBlank()) "Ты" else myName
+        return peopleNames[id] ?: "участник"
+    }
+
+    private fun toastSoon(text: String) {
+        if (now() - lastToastAt < 2500) return
+        lastToastAt = now()
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+    }
+
     private fun onPageEvent(s: String) {
         try {
             val o = JSONObject(s)
             when (o.optString("k")) {
                 "media" -> onLocalMedia(o.optString("a"), o.optDouble("time", 0.0))
                 "pos" -> {
-                    if (lastActorMe && mediaPlaying && roomCode != null) {
+                    if (amController() && mediaPlaying && roomCode != null) {
                         mediaTime = o.optDouble("time", 0.0)
                         mediaAt = now()
                         sendMsg(JSONObject().put("t", "media").put("a", "tick").put("time", mediaTime))
                     }
                 }
-                "blocked" -> Toast.makeText(this, "Нажми ▶ в плеере, чтобы включить видео", Toast.LENGTH_SHORT).show()
+                "ready" -> onVideoReady()
+                "ui" -> onLocalUi(o)
+                "blocked" -> toastSoon("Нажми ▶ в плеере, чтобы включить видео")
             }
         } catch (e: Exception) {
         }
     }
 
+    // На странице появился плеер (например, ты сам нажал на постер): подтягиваем его к состоянию комнаты.
+    private fun onVideoReady() {
+        if (roomCode == null || amController() || !mediaKnown) return
+        runCmd(if (mediaPlaying) "play" else "pause", currentMediaTime())
+    }
+
     private fun onLocalMedia(a: String, t: Double) {
         if (roomCode == null) return
         if (a != "play" && a != "pause" && a != "seek") return
-        if (a == "play") mediaPlaying = true
-        if (a == "pause") mediaPlaying = false
-        mediaTime = t
-        mediaAt = now()
-        lastActorMe = true
-        sendMsg(JSONObject().put("t", "media").put("a", a).put("time", t))
+        if (amController()) {
+            if (a == "play") mediaPlaying = true
+            if (a == "pause") mediaPlaying = false
+            mediaTime = t
+            mediaAt = now()
+            mediaKnown = true
+            sendMsg(JSONObject().put("t", "media").put("a", a).put("time", t))
+        } else if (mediaKnown) {
+            // Управляешь не ты: возвращаем плеер к состоянию комнаты.
+            toastSoon("Видео управляет " + nameOf(controllerId))
+            handler.postDelayed({
+                if (!amController() && roomCode != null) {
+                    runCmd(if (mediaPlaying) "play" else "pause", currentMediaTime())
+                }
+            }, 400)
+        }
     }
 
     private fun remoteMedia(a: String, t: Double) {
@@ -841,7 +1004,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         if (a == "pause") mediaPlaying = false
         mediaTime = t
         mediaAt = now()
-        if (a != "tick") lastActorMe = false
+        mediaKnown = true
         runCmd(a, t)
     }
 
@@ -863,17 +1026,268 @@ class MainActivity : Activity(), SyncBridge.Callback {
         if (roomCode == null) return
         o.put("id", myId)
         o.put("name", myName)
+        o.put("c", controllerId)
         bridge.send(o.toString())
     }
 
     private fun sendState() {
         if (!currentUrl.startsWith("http")) return
-        val m = JSONObject().put("playing", mediaPlaying).put("time", currentMediaTime())
-        sendMsg(JSONObject().put("t", "state").put("url", currentUrl).put("media", m))
+        val o = JSONObject().put("t", "state").put("url", currentUrl)
+            .put("host", hostId).put("ctrl", controllerId)
+        if (mediaKnown) {
+            o.put("media", JSONObject().put("playing", mediaPlaying).put("time", currentMediaTime()))
+        }
+        if (lastScroll >= 0) o.put("sy", lastScroll)
+        sendMsg(o)
     }
 
-    private fun addChat(name: String, text: String) {
-        chatLog.append((if (name.isBlank()) "?" else name) + ": " + text + "\n")
+    // ============================== управление комнатой ==============================
+
+    private fun setController(id: String, announce: Boolean) {
+        controllerId = id
+        controllerSeen = peopleIds.contains(id)
+        updateRoomLabel()
+        if (announce) sendMsg(JSONObject().put("t", "ctrl").put("to", id))
+        if (id == myId) {
+            Toast.makeText(this, "Управление у тебя", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Управляет " + nameOf(id), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fromController(from: String, o: JSONObject): Boolean {
+        if (controllerId.isEmpty()) {
+            val c = o.optString("c")
+            controllerId = if (c.isNotEmpty()) c else from
+            updateRoomLabel()
+        }
+        return from == controllerId
+    }
+
+    private fun showMembers() {
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(16), dp(8), dp(16), dp(8))
+
+        val ids = ArrayList<String>(peopleIds)
+        if (!ids.contains(myId)) ids.add(0, myId)
+        val canGive = amController() || amHost()
+
+        for (id in ids) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.setPadding(0, dp(8), 0, dp(8))
+
+            val av = ImageView(this)
+            circle(av)
+            bindAvatar(av, id, nameOf(id))
+            row.addView(av, LinearLayout.LayoutParams(dp(44), dp(44)))
+
+            val tv = TextView(this)
+            var label = nameOf(id)
+            if (id == myId) label += " (ты)"
+            if (id == hostId) label += "  🏠"
+            if (id == controllerId) label += "  👑"
+            tv.text = label
+            tv.setTextColor(Color.WHITE)
+            tv.textSize = 17f
+            val tp = LinearLayout.LayoutParams(0, WRAP, 1f)
+            tp.leftMargin = dp(12)
+            row.addView(tv, tp)
+
+            if (canGive && id != controllerId) {
+                row.setOnClickListener {
+                    AlertDialog.Builder(this)
+                        .setTitle("Передать управление?")
+                        .setMessage(nameOf(id) + " сможет ставить паузу, перематывать и открывать страницы для всех.")
+                        .setPositiveButton("Передать") { _, _ ->
+                            membersDialog?.dismiss()
+                            setController(id, true)
+                        }
+                        .setNegativeButton("Отмена", null)
+                        .show()
+                }
+            }
+            col.addView(row)
+        }
+
+        val hint = TextView(this)
+        hint.setTextColor(0xFF9A9AB0.toInt())
+        hint.textSize = 13f
+        hint.text = if (canGive) "🏠 — хост, 👑 — у кого управление. Нажми на участника, чтобы передать ему управление."
+        else "🏠 — хост, 👑 — у кого управление. Передать управление может тот, у кого оно есть, или хост."
+        col.addView(hint, lp(8))
+
+        if (amHost() && !amController()) {
+            col.addView(button("Забрать управление себе", ACCENT) {
+                membersDialog?.dismiss()
+                setController(myId, true)
+            }, lp(12))
+        }
+        col.addView(button("Поделиться кодом комнаты", 0xFF2A2A3A.toInt()) { shareCode() }, lp(10))
+
+        val sv = ScrollView(this)
+        sv.addView(col)
+        membersDialog = AlertDialog.Builder(this)
+            .setTitle("Участники")
+            .setView(sv)
+            .setPositiveButton("Закрыть", null)
+            .show()
+    }
+
+    // ============================== аватары ==============================
+
+    private fun circle(iv: ImageView) {
+        iv.scaleType = ImageView.ScaleType.CENTER_CROP
+        iv.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setOval(0, 0, view.width, view.height)
+            }
+        }
+        iv.clipToOutline = true
+    }
+
+    private fun letterBitmap(name: String, id: String): Bitmap {
+        val letter = (name.trim().firstOrNull() ?: '?').uppercaseChar().toString()
+        val key = id + "|" + letter
+        val cached = letterCache[key]
+        if (cached != null) return cached
+        val palette = intArrayOf(
+            0xFF7C3AED.toInt(), 0xFF2563EB.toInt(), 0xFF059669.toInt(), 0xFFD97706.toInt(),
+            0xFFDC2626.toInt(), 0xFFDB2777.toInt(), 0xFF0891B2.toInt()
+        )
+        val color = palette[Math.abs(id.hashCode()) % palette.size]
+        val bmp = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(color)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.color = Color.WHITE
+        paint.textSize = 72f
+        paint.textAlign = Paint.Align.CENTER
+        paint.typeface = Typeface.DEFAULT_BOLD
+        val y = 64f - (paint.ascent() + paint.descent()) / 2f
+        c.drawText(letter, 64f, y, paint)
+        letterCache[key] = bmp
+        return bmp
+    }
+
+    private fun avatarBitmap(id: String, name: String): Bitmap {
+        if (id == myId) {
+            val mine = myAvatar
+            if (mine != null) return mine
+        }
+        val other = avatars[id]
+        if (other != null) return other
+        return letterBitmap(name, id)
+    }
+
+    private fun bindAvatar(iv: ImageView, id: String, name: String) {
+        iv.setImageBitmap(avatarBitmap(id, name))
+    }
+
+    private fun loadMyAvatar() {
+        val b64 = prefs.getString("avatar", null)
+        if (b64 == null) {
+            myAvatar = null
+            myAvatarB64 = null
+            return
+        }
+        try {
+            val bytes = Base64.decode(b64, Base64.DEFAULT)
+            myAvatar = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            myAvatarB64 = b64
+        } catch (e: Exception) {
+            myAvatar = null
+            myAvatarB64 = null
+        }
+    }
+
+    private fun pickAvatar() {
+        val i = Intent(Intent.ACTION_GET_CONTENT)
+        i.type = "image/*"
+        startActivityForResult(Intent.createChooser(i, "Выбери аватар"), 77)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 77 && resultCode == RESULT_OK) {
+            val uri = data?.data
+            if (uri != null) processAvatar(uri)
+        }
+    }
+
+    private fun processAvatar(uri: Uri) {
+        try {
+            val bounds = BitmapFactory.Options()
+            bounds.inJustDecodeBounds = true
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= 256 && bounds.outHeight / (sample * 2) >= 256) sample *= 2
+            val opts = BitmapFactory.Options()
+            opts.inSampleSize = sample
+            val src = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+            if (src == null) {
+                Toast.makeText(this, "Не удалось открыть картинку", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val side = Math.min(src.width, src.height)
+            val square = Bitmap.createBitmap(src, (src.width - side) / 2, (src.height - side) / 2, side, side)
+            val small = Bitmap.createScaledBitmap(square, 128, 128, true)
+            val bos = ByteArrayOutputStream()
+            small.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+            prefs.edit().putString("avatar", Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)).apply()
+            loadMyAvatar()
+            bindAvatar(homeAvatar, myId, if (myName.isBlank()) "?" else myName)
+            if (roomCode != null) sendMyAvatar()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Не удалось загрузить аватар", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun sendMyAvatar() {
+        val b = myAvatarB64 ?: return
+        sendMsg(JSONObject().put("t", "avatar").put("img", b))
+    }
+
+    private fun storeAvatar(from: String, b64: String) {
+        if (from.isEmpty() || b64.isEmpty() || b64.length > 80000) return
+        try {
+            val bytes = Base64.decode(b64, Base64.DEFAULT)
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            if (bmp != null) avatars[from] = bmp
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun addChat(id: String, name: String, text: String) {
+        val shownName = if (name.isBlank()) "?" else name
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.setPadding(0, dp(4), 0, dp(4))
+
+        val av = ImageView(this)
+        circle(av)
+        bindAvatar(av, id, shownName)
+        row.addView(av, LinearLayout.LayoutParams(dp(32), dp(32)))
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        val n = TextView(this)
+        n.text = shownName
+        n.textSize = 12f
+        n.setTextColor(0xFFA78BFA.toInt())
+        val t = TextView(this)
+        t.text = text
+        t.textSize = 15f
+        t.setTextColor(Color.WHITE)
+        col.addView(n)
+        col.addView(t)
+        val cp = LinearLayout.LayoutParams(0, WRAP, 1f)
+        cp.leftMargin = dp(10)
+        row.addView(col, cp)
+
+        chatBox.addView(row)
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
         if (chatPanel.visibility != View.VISIBLE) chatBtn.text = "💬•"
     }
@@ -884,6 +1298,11 @@ class MainActivity : Activity(), SyncBridge.Callback {
         connStatus = "онлайн"
         updateRoomLabel()
         sendMsg(JSONObject().put("t", "hello"))
+        sendMyAvatar()
+        // хост после обновления страницы или перезапуска возвращает себе управление
+        if (amHost() && amController()) {
+            sendMsg(JSONObject().put("t", "ctrl").put("to", myId))
+        }
     }
 
     override fun onStatus(status: String) {
@@ -897,7 +1316,25 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     override fun onPeople(json: String) {
         try {
-            peopleCount = JSONArray(json).length()
+            val arr = JSONArray(json)
+            peopleIds.clear()
+            for (i in 0 until arr.length()) {
+                val p = arr.getJSONObject(i)
+                val id = p.optString("id")
+                peopleIds.add(id)
+                val n = p.optString("name")
+                if (n.isNotBlank() && id != myId) peopleNames[id] = n
+            }
+            peopleCount = arr.length()
+            // Если управляющий ушёл — управление переходит хосту (или участнику с наименьшим id).
+            if (controllerId.isNotEmpty()) {
+                if (peopleIds.contains(controllerId)) {
+                    controllerSeen = true
+                } else if (controllerSeen && peopleIds.isNotEmpty()) {
+                    val next = if (peopleIds.contains(hostId)) hostId else (peopleIds.minOrNull() ?: "")
+                    if (next == myId) setController(myId, true)
+                }
+            }
         } catch (e: Exception) {
         }
         updateRoomLabel()
@@ -906,12 +1343,25 @@ class MainActivity : Activity(), SyncBridge.Callback {
     override fun onMessage(json: String) {
         try {
             val o = JSONObject(json)
-            if (o.optString("id") == myId) return
+            val from = o.optString("id")
+            if (from == myId) return
+            val nm = o.optString("name")
+            if (from.isNotEmpty() && nm.isNotBlank()) peopleNames[from] = nm
+
             when (o.optString("t")) {
-                "hello" -> sendState()
+                "hello" -> {
+                    sendState()
+                    sendMyAvatar()
+                }
                 "state" -> {
+                    val h = o.optString("host")
+                    val c = o.optString("ctrl")
+                    if (hostId.isEmpty() && h.isNotEmpty()) hostId = h
+                    if (controllerId.isEmpty() && c.isNotEmpty()) controllerId = c
+                    updateRoomLabel()
                     if (stateReceived) return
                     stateReceived = true
+                    if (o.has("sy")) lastScroll = o.optDouble("sy", -1.0)
                     val url = o.optString("url")
                     val m = o.optJSONObject("media")
                     if (m != null) {
@@ -920,22 +1370,40 @@ class MainActivity : Activity(), SyncBridge.Callback {
                         mediaPlaying = a == "play"
                         mediaTime = t
                         mediaAt = now()
+                        mediaKnown = true
                         pendingCmd = Triple(a, t, now())
                     }
                     if (url.isNotEmpty()) openRemote(url)
                 }
                 "nav" -> {
-                    if (isHost && !o.optBoolean("force")) return
+                    if (!fromController(from, o) || amController()) return
                     val url = o.optString("url")
                     if (url.isNotEmpty()) {
                         mediaPlaying = false
                         mediaTime = 0.0
+                        mediaKnown = false
+                        lastScroll = -1.0
                         pendingCmd = null
                         openRemote(url)
                     }
                 }
-                "media" -> remoteMedia(o.optString("a"), o.optDouble("time", 0.0))
-                "chat" -> addChat(o.optString("name"), o.optString("text"))
+                "media" -> {
+                    if (!fromController(from, o) || amController()) return
+                    remoteMedia(o.optString("a"), o.optDouble("time", 0.0))
+                }
+                "ctrl" -> {
+                    if (controllerId.isEmpty() || from == controllerId || from == hostId) {
+                        setController(o.optString("to"), false)
+                    }
+                }
+                "ui" -> {
+                    if (!fromController(from, o) || amController()) return
+                    val c = cleanUi(o) ?: return
+                    if (c.optString("e") == "scroll") lastScroll = c.optDouble("y", 0.0)
+                    web.evaluateJavascript("window.__coUi&&window.__coUi(" + c.toString() + ")", null)
+                }
+                "avatar" -> storeAvatar(from, o.optString("img"))
+                "chat" -> addChat(from, nm, o.optString("text"))
             }
         } catch (e: Exception) {
         }

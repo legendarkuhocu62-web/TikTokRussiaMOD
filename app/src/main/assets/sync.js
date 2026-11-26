@@ -109,6 +109,119 @@
   }
   ['play', 'pause', 'seeked'].forEach(function (n) { document.addEventListener(n, onMedia, true); });
 
+  // Появился новый плеер (или его запустили): просим приложение подтянуть его к состоянию комнаты.
+  var seen = typeof WeakSet === 'function' ? new WeakSet() : null;
+  function onReadyEv(e) {
+    var v = e.target;
+    if (!v || v.tagName !== 'VIDEO') return;
+    if (area(v) < MIN_AREA) return;
+    if (seen) { if (seen.has(v)) return; seen.add(v); }
+    post({ k: 'ready' });
+  }
+  ['loadedmetadata', 'playing', 'play'].forEach(function (n) { document.addEventListener(n, onReadyEv, true); });
+
+  // ===== Зеркалирование интерфейса: прокрутка, нажатия, ввод (только верхний документ) =====
+  if (window === window.top) {
+    var uiSuppress = 0, scrollT = null;
+
+    var cssPath = function (el) {
+      var parts = [];
+      while (el && el.nodeType === 1 && el !== document.documentElement) {
+        var part = el.nodeName.toLowerCase();
+        if (el.id && /^[A-Za-z][\w-]*$/.test(el.id) && document.querySelectorAll('#' + el.id).length === 1) {
+          parts.unshift('#' + el.id);
+          break;
+        }
+        var idx = 1, sib = el;
+        while ((sib = sib.previousElementSibling)) { if (sib.nodeName === el.nodeName) idx++; }
+        parts.unshift(part + ':nth-of-type(' + idx + ')');
+        el = el.parentElement;
+      }
+      return parts.join(' > ');
+    };
+
+    var scrollRatio = function () {
+      var d = document.documentElement;
+      var max = Math.max(1, (d.scrollHeight || 0) - window.innerHeight);
+      var y = window.pageYOffset || d.scrollTop || 0;
+      return Math.min(1, Math.max(0, y / max));
+    };
+
+    var ripple = function (x, y) {
+      try {
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;width:46px;height:46px;' +
+          'margin:-23px 0 0 -23px;border-radius:50%;border:3px solid #a78bfa;background:rgba(124,58,237,.35);' +
+          'left:' + x + 'px;top:' + y + 'px;transition:transform .55s ease-out,opacity .55s ease-out;' +
+          'transform:scale(.4);opacity:1';
+        (document.body || document.documentElement).appendChild(d);
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () { d.style.transform = 'scale(1.7)'; d.style.opacity = '0'; });
+        });
+        setTimeout(function () { if (d.parentNode) d.parentNode.removeChild(d); }, 800);
+      } catch (e) {}
+    };
+
+    // --- управляющий: отправляет ---
+    window.addEventListener('scroll', function () {
+      if (!window.__coCtl || Date.now() < uiSuppress || scrollT) return;
+      scrollT = setTimeout(function () {
+        scrollT = null;
+        post({ k: 'ui', e: 'scroll', y: scrollRatio() });
+      }, 120);
+    }, { passive: true });
+
+    document.addEventListener('click', function (e) {
+      if (!window.__coCtl || !e.isTrusted) return;
+      post({ k: 'ui', e: 'click', sel: cssPath(e.target), nx: e.clientX / window.innerWidth, ny: e.clientY / window.innerHeight });
+    }, true);
+
+    document.addEventListener('input', function (e) {
+      if (!window.__coCtl || !e.isTrusted) return;
+      var t = e.target;
+      if (!t || !/^(INPUT|TEXTAREA)$/.test(t.tagName)) return;
+      var ty = (t.type || '').toLowerCase();
+      if (ty === 'password' || ty === 'file') return;
+      var ac = (t.getAttribute('autocomplete') || '').toLowerCase();
+      if (ac.indexOf('cc-') === 0 || ac.indexOf('password') >= 0) return;
+      post({ k: 'ui', e: 'input', sel: cssPath(t), val: String(t.value).slice(0, 500) });
+    }, true);
+
+    // --- остальные: повторяют ---
+    window.__coUi = function (d) {
+      if (!d) return;
+      try {
+        if (d.e === 'scroll') {
+          var dd = document.documentElement;
+          var max = Math.max(0, (dd.scrollHeight || 0) - window.innerHeight);
+          uiSuppress = Date.now() + 500;
+          window.scrollTo(0, Math.round((d.y || 0) * max));
+        } else if (d.e === 'click') {
+          var x = d.nx * window.innerWidth, y = d.ny * window.innerHeight;
+          ripple(x, y);
+          var el = null;
+          try { el = d.sel ? document.querySelector(d.sel) : null; } catch (err) {}
+          if (!el) el = document.elementFromPoint(x, y);
+          if (!el) return;
+          // Переходы по ссылкам повторяет синхронизация адреса, чтобы не открывать дважды.
+          var a = el.closest ? el.closest('a[href]') : null;
+          if (a && /^https?:/i.test(a.href)) return;
+          el.click();
+        } else if (d.e === 'input') {
+          var f = null;
+          try { f = document.querySelector(d.sel); } catch (err) {}
+          if (f && 'value' in f) {
+            var proto = f.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(f, d.val); else f.value = d.val;
+            f.dispatchEvent(new Event('input', { bubbles: true }));
+            f.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+      } catch (err) {}
+    };
+  }
+
   // Раз в 5 секунд сообщаем позицию — приложение решает, рассылать ли её.
   setInterval(function () {
     var v = mainVideo();
