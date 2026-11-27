@@ -368,13 +368,22 @@
     };
   }
 
-  // Сообщаем приложению, какое видео играет (адрес источника), чтобы зритель включил тот же поток.
+  // Сообщаем приложению, что на странице играет видео, и как его лучше передать зрителям:
+  // 'capture' — снять картинку и звук прямо с плеера (WebRTC), 'direct' — файл с чужого сервера без разрешения для захвата
+  // (картинка при захвате была бы чёрной), тогда зрителю отдаётся прямой адрес.
   function reportSrc(v) {
     var d = v.duration;
-    if (isFinite(d) && d < 20) return; // короткие превью пропускаем
-    post({ k: 'src', url: v.currentSrc || v.src || '', dur: isFinite(d) ? d : 0, page: location.href });
+    var src = v.currentSrc || v.src || '';
+    var direct = false;
+    try {
+      if (/^https?:/i.test(src)) {
+        var u = new URL(src, location.href);
+        direct = (u.origin !== location.origin) && !v.crossOrigin;
+      }
+    } catch (e) {}
+    post({ k: 'src', url: src, mode: direct ? 'direct' : 'capture', dur: isFinite(d) ? d : 0, page: location.href });
   }
-  ['loadedmetadata', 'durationchange'].forEach(function (n) {
+  ['loadedmetadata', 'durationchange', 'playing'].forEach(function (n) {
     document.addEventListener(n, function (e) {
       var v = e.target;
       if (!v || v.tagName !== 'VIDEO' || area(v) < MIN_AREA) return;

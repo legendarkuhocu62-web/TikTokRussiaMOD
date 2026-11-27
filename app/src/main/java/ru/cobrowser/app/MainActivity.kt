@@ -1011,7 +1011,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
         val hostGone = hostId.isNotEmpty() && hostId != myId && ownerSeen && !peopleIds.contains(hostId)
         val crown = if (hostGone) " · ⚠ хост не в сети"
         else if (controllerId.isNotEmpty()) " · 👑" + nameOf(controllerId) else ""
-        val statusShort = if (connStatus == "онлайн") "●" else connStatus
+        val modeMark = if ((amOwner() && liveOn) || liveMode) "📡"
+        else if (player != null || (amOwner() && streamUrl != null)) "🎞" else ""
+        val statusShort = (if (connStatus == "онлайн") "●" else connStatus) + modeMark
         roomLabel.text = "${roomCode ?: ""} · 👥$peopleCount\n$statusShort$crown"
         updateShield()
         runRole()
@@ -1258,12 +1260,34 @@ class MainActivity : Activity(), SyncBridge.Callback {
         }
     }
 
-    // Главный сообщил, что на странице играет видео: зрители начнут получать его картинку и звук.
+    // Главный сообщил, что на странице играет видео. Зрителям оно передаётся одним из двух способов:
+    // живая картинка с плеера главного (WebRTC) или, если захват невозможен, прямой адрес файла.
     private fun onPageSrc(o: JSONObject) {
         if (!amOwner() || roomCode == null) return
+        val url = o.optString("url")
+        val mode = o.optString("mode")
+        if (mode == "direct" && (url.startsWith("http://") || url.startsWith("https://"))) {
+            if (url == streamUrl) return
+            val page = o.optString("page")
+            val h = mediaReq[url]
+            val ref = h?.first ?: (if (page.startsWith("http")) page else currentUrl)
+            val org = h?.second ?: originOf(ref)
+            streamUrl = url
+            streamRef = ref
+            streamOrigin = org
+            liveOn = false
+            sendMsg(
+                JSONObject().put("t", "src").put("url", url)
+                    .put("ref", ref).put("org", org ?: "")
+            )
+            updateRoomLabel()
+            return
+        }
         if (!liveOn) {
             liveOn = true
+            streamUrl = null
             sendMsg(JSONObject().put("t", "live").put("on", true))
+            updateRoomLabel()
         }
     }
 
@@ -1275,6 +1299,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
             tpl = assets.open("viewer.html").bufferedReader().use { it.readText() }
             viewerTemplate = tpl
         }
+        releasePlayer()
+        playerHolder.visibility = View.GONE
         liveMode = true
         ytFor = null
         pickerScroll.visibility = View.GONE
@@ -1331,6 +1357,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private fun startStream() {
         val url = streamUrl ?: return
         if (amOwner() || roomCode == null || url == streamFailedUrl || now() < pickingUntil) return
+        liveMode = false
         releasePlayer()
         streamInitialApplied = false
         val headers = HashMap<String, String>()
@@ -1886,7 +1913,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         // та же страница: подтягиваем только расхождения
         if (live && !liveMode && rtcFailedUrl != url) {
             startLive()
-        } else if (!live && liveMode) {
+        } else if (!live && liveMode && srcObj == null) {
             stopLive()
         }
         if (srcObj != null) {

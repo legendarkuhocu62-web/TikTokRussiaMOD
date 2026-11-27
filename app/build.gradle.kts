@@ -7,17 +7,34 @@ android {
     namespace = "ru.cobrowser.app"
     compileSdk = 34
 
+    // Постоянный ключ подписи: каждая сборка подписана одним и тем же ключом,
+    // поэтому новая версия ставится поверх старой без удаления приложения.
+    signingConfigs {
+        create("cobrowser") {
+            storeFile = file("cobrowser.keystore")
+            storeType = "pkcs12"
+            storePassword = "cobrowser123"
+            keyAlias = "cobrowser"
+            keyPassword = "cobrowser123"
+        }
+    }
+
     defaultConfig {
         applicationId = "ru.cobrowser.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // номер версии растёт с каждой сборкой на GitHub, чтобы установщик видел обновление
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionName = "1." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
     }
 
     buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("cobrowser")
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("cobrowser")
         }
     }
     compileOptions {
