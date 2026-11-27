@@ -16,6 +16,7 @@ object Services {
     val list: List<Service> = listOf(
         Service("YouTube", "https://m.youtube.com/", "youtube.com", 0xFFE62117.toInt(), "▶"),
         Service("Google", "https://www.google.com/", "google.com", 0xFF4285F4.toInt(), "G"),
+        Service("Яндекс", "https://ya.ru/", "yandex.ru", 0xFFFC3F1D.toInt(), "Я"),
         Service("Netflix", "https://www.netflix.com/", "netflix.com", 0xFF111111.toInt(), "N"),
         Service("Disney+", "https://www.disneyplus.com/", "disneyplus.com", 0xFF113CCF.toInt(), "D+"),
         Service("RuTube", "https://rutube.ru/", "rutube.ru", 0xFF1BBF4B.toInt(), "R"),

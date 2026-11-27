@@ -222,6 +222,20 @@
     };
   }
 
+  // Сообщаем приложению, какое видео играет (адрес источника), чтобы зритель включил тот же поток.
+  function reportSrc(v) {
+    var d = v.duration;
+    if (isFinite(d) && d < 90) return; // рекламу и превью пропускаем
+    post({ k: 'src', url: v.currentSrc || v.src || '', dur: isFinite(d) ? d : 0, page: location.href });
+  }
+  ['loadedmetadata', 'durationchange'].forEach(function (n) {
+    document.addEventListener(n, function (e) {
+      var v = e.target;
+      if (!v || v.tagName !== 'VIDEO' || area(v) < MIN_AREA) return;
+      reportSrc(v);
+    }, true);
+  });
+
   // Раз в 5 секунд сообщаем позицию — приложение решает, рассылать ли её.
   setInterval(function () {
     var v = mainVideo();

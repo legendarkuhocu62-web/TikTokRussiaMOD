@@ -21,6 +21,7 @@ import android.os.Looper
 import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
@@ -30,6 +31,7 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -40,6 +42,15 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONArray
@@ -113,6 +124,25 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private lateinit var chatBox: LinearLayout
     private var membersDialog: AlertDialog? = null
 
+    // --- режим «зритель»: поток играет нативный плеер ---
+    private var streamUrl: String? = null
+    private var streamRef: String? = null
+    private var streamOrigin: String? = null
+    private var streamFailedUrl: String? = null
+    private var player: ExoPlayer? = null
+    private lateinit var playerHolder: FrameLayout
+    private lateinit var topBar: LinearLayout
+    private var streamInitialApplied = false
+    private var streamFull = false
+    private var videoW = 0
+    private var videoH = 0
+    private var takeoverSeek = false
+    private var lastManifestUrl: String? = null
+    private var lastManifestAt = 0L
+    private var lastFileUrl: String? = null
+    private var lastFileAt = 0L
+    private val mediaReq = HashMap<String, Pair<String?, String?>>()
+
     // --- зеркалирование экрана ---
     private lateinit var pinBtn: TextView
     private lateinit var shield: View
@@ -155,6 +185,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     override fun onDestroy() {
         super.onDestroy()
+        releasePlayer()
         bridge.destroy()
         web.destroy()
     }
@@ -163,6 +194,10 @@ class MainActivity : Activity(), SyncBridge.Callback {
     override fun onBackPressed() {
         if (customView != null) {
             exitFullscreen()
+            return
+        }
+        if (streamFull) {
+            toggleStreamFullscreen()
             return
         }
         if (roomLayout.visibility == View.VISIBLE) {
@@ -309,7 +344,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
         bar.setBackgroundColor(CARD)
         bar.setPadding(dp(4), 0, dp(4), 0)
 
-        bar.addView(iconBtn("⌂") { showPicker() })
+        topBar = bar
+        bar.addView(iconBtn("⌂") { onHomeClick() })
         pinBtn = iconBtn("📍") { onPinClick() }
         bar.addView(pinBtn)
         starBtn = iconBtn("☆") { toggleFavorite() }
@@ -340,6 +376,15 @@ class MainActivity : Activity(), SyncBridge.Callback {
         shield.setOnTouchListener { _, _ -> true }
         shield.visibility = View.GONE
         content.addView(shield, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        playerHolder = FrameLayout(this)
+        playerHolder.setBackgroundColor(Color.BLACK)
+        playerHolder.visibility = View.GONE
+        playerHolder.setOnClickListener { toggleStreamFullscreen() }
+        playerHolder.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (videoW > 0 && videoH > 0) fitVideo(videoW, videoH)
+        }
+        content.addView(playerHolder, FrameLayout.LayoutParams(MATCH, MATCH))
 
         chatPanel = buildChat()
         chatPanel.visibility = View.GONE
@@ -516,8 +561,29 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 return !(u.startsWith("http://") || u.startsWith("https://"))
             }
 
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val r = request ?: return null
+                val url = r.url.toString()
+                val low = url.substringBefore('#').lowercase(Locale.ROOT)
+                val path = low.substringBefore('?')
+                val manifest = path.endsWith(".m3u8") || path.endsWith(".mpd") || low.contains(".m3u8?")
+                val file = path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".m4v") ||
+                    path.endsWith(".mkv") || path.endsWith(".mov")
+                if (manifest || file) {
+                    val h = r.requestHeaders
+                    val ref = h?.get("Referer") ?: h?.get("referer")
+                    val org = h?.get("Origin") ?: h?.get("origin")
+                    handler.post { onMediaRequest(url, manifest, ref, org) }
+                }
+                return null
+            }
+
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                 if (url == null || !url.startsWith("http")) return
+                if (url != currentUrl) {
+                    lastManifestUrl = null
+                    lastFileUrl = null
+                }
                 currentUrl = url
                 updateStar()
                 if (roomCode != null) prefs.edit().putString("last_url_" + roomCode, url).apply()
@@ -762,6 +828,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
         mediaPlaying = false
         mediaTime = 0.0
         pendingCmd = null
+        leaveStream()
+        lastManifestUrl = null
+        lastFileUrl = null
         mediaKnown = false
         controllerSeen = false
         hostId = if (host) myId else ""
@@ -800,6 +869,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     }
 
     private fun leaveRoom() {
+        leaveStream()
         bridge.leave()
         val code = roomCode
         roomCode = null
@@ -889,6 +959,10 @@ class MainActivity : Activity(), SyncBridge.Callback {
     // ============================== навигация ==============================
 
     private fun openLocal(url: String) {
+        if (!amController() && controllerId.isNotEmpty()) {
+            Toast.makeText(this, "Сайт выбирает тот, у кого управление: " + nameOf(controllerId), Toast.LENGTH_SHORT).show()
+            return
+        }
         showWeb()
         if (url == currentUrl && web.url == url) return
         web.loadUrl(url)
@@ -912,6 +986,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
         mediaTime = 0.0
         mediaKnown = false
         lastScroll = -1.0
+        streamUrl = null
+        streamFailedUrl = null
         mediaAt = System.currentTimeMillis()
         sendMsg(JSONObject().put("t", "nav").put("url", url).put("force", force))
     }
@@ -935,6 +1011,241 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     private fun currentMediaTime(): Double =
         if (mediaPlaying) mediaTime + (now() - mediaAt) / 1000.0 else mediaTime
+
+    // ============================== режим «зритель»: поток ==============================
+
+    private fun originOf(url: String?): String? {
+        if (url == null) return null
+        return try {
+            val u = java.net.URI(url)
+            if (u.scheme == null || u.host == null) null
+            else u.scheme + "://" + u.host + (if (u.port != -1) ":" + u.port else "")
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // Приложение видит все запросы страницы и запоминает адреса видео/плейлистов вместе с заголовками.
+    private fun onMediaRequest(url: String, manifest: Boolean, ref: String?, org: String?) {
+        if (mediaReq.size > 80) mediaReq.clear()
+        mediaReq[url] = Pair(ref, org)
+        val t = now()
+        if (manifest) {
+            // первым идёт главный плейлист, дальше только его варианты: оставляем первый
+            if (lastManifestUrl == null || t - lastManifestAt > 8000) lastManifestUrl = url
+            lastManifestAt = t
+        } else {
+            lastFileUrl = url
+            lastFileAt = t
+        }
+    }
+
+    // Страница сообщила, что в ней играет длинное видео: запоминаем источник и рассылаем зрителям.
+    private fun onPageSrc(o: JSONObject) {
+        if (!amController() || roomCode == null) return
+        val url = o.optString("url")
+        val page = o.optString("page")
+        var chosen: String? = null
+        if (url.startsWith("http://") || url.startsWith("https://")) {
+            chosen = url
+        } else if (lastManifestUrl != null && now() - lastManifestAt < 180000) {
+            chosen = lastManifestUrl
+        } else if (lastFileUrl != null && now() - lastFileAt < 180000) {
+            chosen = lastFileUrl
+        }
+        if (chosen == null || chosen == streamUrl) return
+        val h = mediaReq[chosen]
+        val ref = h?.first ?: (if (page.startsWith("http")) page else currentUrl)
+        val org = h?.second ?: originOf(ref)
+        streamUrl = chosen
+        streamRef = ref
+        streamOrigin = org
+        sendMsg(
+            JSONObject().put("t", "src").put("url", chosen)
+                .put("ref", ref).put("org", org ?: "")
+        )
+    }
+
+    private fun applySrc(o: JSONObject): Boolean {
+        val url = o.optString("url")
+        if (!(url.startsWith("http://") || url.startsWith("https://")) || url.length > 3000) return false
+        if (url == streamUrl && player != null) return false
+        streamUrl = url
+        streamRef = o.optString("ref").take(2000)
+        streamOrigin = o.optString("org").take(300)
+        if (url != streamFailedUrl) streamFailedUrl = null
+        return true
+    }
+
+    private fun startStream() {
+        val url = streamUrl ?: return
+        if (amController() || roomCode == null || url == streamFailedUrl) return
+        releasePlayer()
+        streamInitialApplied = false
+        val headers = HashMap<String, String>()
+        val r = streamRef
+        if (r != null && r.isNotEmpty()) headers["Referer"] = r
+        val org = streamOrigin
+        if (org != null && org.isNotEmpty()) headers["Origin"] = org
+        try {
+            val dsf = DefaultHttpDataSource.Factory()
+                .setUserAgent(web.settings.userAgentString)
+                .setAllowCrossProtocolRedirects(true)
+                .setDefaultRequestProperties(headers)
+            val p = ExoPlayer.Builder(this)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(dsf))
+                .build()
+            // не перехватываем звук у Discord и других приложений
+            p.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
+                false
+            )
+            val sv = SurfaceView(this)
+            playerHolder.removeAllViews()
+            playerHolder.addView(sv, FrameLayout.LayoutParams(MATCH, MATCH))
+            p.setVideoSurfaceView(sv)
+            p.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_READY && !streamInitialApplied) {
+                        streamInitialApplied = true
+                        exoApply(if (mediaKnown && mediaPlaying) "play" else "pause", currentMediaTime())
+                    }
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    onStreamError(url)
+                }
+
+                override fun onVideoSizeChanged(videoSize: VideoSize) {
+                    videoW = videoSize.width
+                    videoH = videoSize.height
+                    fitVideo(videoW, videoH)
+                }
+            })
+            p.setMediaItem(MediaItem.fromUri(url))
+            p.prepare()
+            player = p
+        } catch (e: Exception) {
+            onStreamError(url)
+            return
+        }
+        // свою страницу зрителя останавливаем: никакой рекламы и двойного звука
+        web.loadUrl("about:blank")
+        pickerScroll.visibility = View.GONE
+        web.visibility = View.GONE
+        playerHolder.visibility = View.VISIBLE
+        updateShield()
+        toastSoon("Смотрим вместе. Управляет " + nameOf(controllerId))
+    }
+
+    private fun onStreamError(url: String) {
+        streamFailedUrl = url
+        releasePlayer()
+        playerHolder.visibility = View.GONE
+        if (streamFull) toggleStreamFullscreen()
+        Toast.makeText(this, "Поток не запустился, показываю саму страницу", Toast.LENGTH_LONG).show()
+        if (currentUrl.startsWith("http")) {
+            suppressedUrl = currentUrl
+            showWeb()
+            web.loadUrl(currentUrl)
+        }
+    }
+
+    private fun releasePlayer() {
+        val p = player
+        player = null
+        if (p != null) {
+            try {
+                p.release()
+            } catch (e: Exception) {
+            }
+        }
+        if (this::playerHolder.isInitialized) playerHolder.removeAllViews()
+        videoW = 0
+        videoH = 0
+    }
+
+    private fun leaveStream() {
+        releasePlayer()
+        if (this::playerHolder.isInitialized) playerHolder.visibility = View.GONE
+        if (streamFull) toggleStreamFullscreen()
+        streamUrl = null
+        streamFailedUrl = null
+    }
+
+    private fun exoApply(a: String, t: Double) {
+        val p = player ?: return
+        val cur = p.currentPosition / 1000.0
+        val ms = (t * 1000).toLong()
+        when (a) {
+            "pause" -> {
+                p.playWhenReady = false
+                if (Math.abs(cur - t) > 0.5) p.seekTo(ms)
+            }
+            "play" -> {
+                if (Math.abs(cur - t) > 0.7) p.seekTo(ms)
+                p.playWhenReady = true
+            }
+            "seek" -> p.seekTo(ms)
+            "tick" -> {
+                if (Math.abs(cur - t) > 2.0) p.seekTo(ms)
+                if (!p.playWhenReady) p.playWhenReady = true
+            }
+        }
+    }
+
+    private fun fitVideo(vw: Int, vh: Int) {
+        if (!this::playerHolder.isInitialized || playerHolder.childCount == 0) return
+        val hw = playerHolder.width
+        val hh = playerHolder.height
+        if (hw == 0 || hh == 0 || vw == 0 || vh == 0) return
+        val scale = Math.min(hw.toFloat() / vw, hh.toFloat() / vh)
+        val lp = FrameLayout.LayoutParams((vw * scale).toInt(), (vh * scale).toInt(), Gravity.CENTER)
+        playerHolder.getChildAt(0).layoutParams = lp
+    }
+
+    // Нажатие на видео — полный экран (боком) и обратно.
+    private fun toggleStreamFullscreen() {
+        streamFull = !streamFull
+        topBar.visibility = if (streamFull) View.GONE else View.VISIBLE
+        requestedOrientation = if (streamFull) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        hideSystemUi(streamFull)
+    }
+
+    private fun onHomeClick() {
+        if (amController() || controllerId.isEmpty()) {
+            showPicker()
+        } else {
+            Toast.makeText(this, "Сайт выбирает тот, у кого управление: " + nameOf(controllerId), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Управление перешло: бывший управляющий становится зрителем, новый открывает настоящий сайт.
+    private fun onRoleChanged() {
+        if (roomCode == null) return
+        if (amController()) {
+            val wasStream = player != null
+            releasePlayer()
+            playerHolder.visibility = View.GONE
+            if (streamFull) toggleStreamFullscreen()
+            streamUrl = null
+            streamFailedUrl = null
+            takeoverSeek = mediaKnown
+            val wu = web.url
+            if (currentUrl.startsWith("http") && (wasStream || wu == null || wu == "about:blank")) {
+                suppressedUrl = currentUrl
+                showWeb()
+                web.loadUrl(currentUrl)
+            }
+        } else if (streamUrl != null) {
+            startStream()
+        }
+        updateShield()
+    }
 
     private fun amController(): Boolean = controllerId.isNotEmpty() && controllerId == myId
 
@@ -964,6 +1275,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                     }
                 }
                 "ready" -> onVideoReady()
+                "src" -> onPageSrc(o)
                 "ui" -> onLocalUi(o)
                 "blocked" -> toastSoon("Нажми ▶ в плеере, чтобы включить видео")
             }
@@ -973,7 +1285,15 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     // На странице появился плеер (например, ты сам нажал на постер): подтягиваем его к состоянию комнаты.
     private fun onVideoReady() {
-        if (roomCode == null || amController() || !mediaKnown) return
+        if (roomCode == null || !mediaKnown) return
+        if (amController()) {
+            // новый управляющий: ставим его плеер на место, где остановились
+            if (takeoverSeek) {
+                takeoverSeek = false
+                runCmd("pause", currentMediaTime())
+            }
+            return
+        }
         runCmd(if (mediaPlaying) "play" else "pause", currentMediaTime())
     }
 
@@ -1005,7 +1325,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         mediaTime = t
         mediaAt = now()
         mediaKnown = true
-        runCmd(a, t)
+        if (player != null) exoApply(a, t) else runCmd(a, t)
     }
 
     private fun runCmd(a: String, t: Double) {
@@ -1038,6 +1358,10 @@ class MainActivity : Activity(), SyncBridge.Callback {
             o.put("media", JSONObject().put("playing", mediaPlaying).put("time", currentMediaTime()))
         }
         if (lastScroll >= 0) o.put("sy", lastScroll)
+        val su = streamUrl
+        if (su != null) {
+            o.put("src", JSONObject().put("url", su).put("ref", streamRef ?: "").put("org", streamOrigin ?: ""))
+        }
         sendMsg(o)
     }
 
@@ -1053,6 +1377,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         } else {
             Toast.makeText(this, "Управляет " + nameOf(id), Toast.LENGTH_SHORT).show()
         }
+        onRoleChanged()
     }
 
     private fun fromController(from: String, o: JSONObject): Boolean {
@@ -1363,6 +1688,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                     stateReceived = true
                     if (o.has("sy")) lastScroll = o.optDouble("sy", -1.0)
                     val url = o.optString("url")
+                    val srcObj = o.optJSONObject("src")
                     val m = o.optJSONObject("media")
                     if (m != null) {
                         val a = if (m.optBoolean("playing")) "play" else "pause"
@@ -1373,7 +1699,13 @@ class MainActivity : Activity(), SyncBridge.Callback {
                         mediaKnown = true
                         pendingCmd = Triple(a, t, now())
                     }
-                    if (url.isNotEmpty()) openRemote(url)
+                    if (srcObj != null && url.isNotEmpty() && !amController() && applySrc(srcObj)) {
+                        // у управляющего уже идёт видео: страницу не грузим, сразу включаем поток
+                        currentUrl = url
+                        startStream()
+                    } else if (url.isNotEmpty()) {
+                        openRemote(url)
+                    }
                 }
                 "nav" -> {
                     if (!fromController(from, o) || amController()) return
@@ -1384,6 +1716,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                         mediaKnown = false
                         lastScroll = -1.0
                         pendingCmd = null
+                        leaveStream()
                         openRemote(url)
                     }
                 }
@@ -1396,7 +1729,12 @@ class MainActivity : Activity(), SyncBridge.Callback {
                         setController(o.optString("to"), false)
                     }
                 }
+                "src" -> {
+                    if (!fromController(from, o) || amController()) return
+                    if (applySrc(o)) startStream()
+                }
                 "ui" -> {
+                    if (player != null) return
                     if (!fromController(from, o) || amController()) return
                     val c = cleanUi(o) ?: return
                     if (c.optString("e") == "scroll") lastScroll = c.optDouble("y", 0.0)
