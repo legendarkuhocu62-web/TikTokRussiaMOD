@@ -1,6 +1,147 @@
+// ===== Публикация видео: у главного настоящий плеер, зрители получают его картинку и звук по WebRTC =====
+(function () {
+  if (window.__coYt) return;
+  try { if (location.hostname === 'cobrowser.app') return; } catch (e) {}
+  if (window.__coPubInstalled) return;
+  window.__coPubInstalled = true;
+
+  var ICE = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
+  var peers = {};          // id зрителя -> { pc, senders, pending }
+  var capVideo = null, capStream = null;
+
+  function post(o) {
+    try {
+      var s = JSON.stringify(o);
+      if (window.CoBridge && window.CoBridge.postMessage) window.CoBridge.postMessage(s);
+      else if (window.CoNative && window.CoNative.postEvent) window.CoNative.postEvent(s);
+    } catch (e) {}
+  }
+  function area(v) { try { var r = v.getBoundingClientRect(); return r.width * r.height; } catch (e) { return 0; } }
+  function mainVideo() {
+    var vs = document.getElementsByTagName('video'), best = null, ba = 0;
+    for (var i = 0; i < vs.length; i++) { var a = area(vs[i]); if (a > ba) { ba = a; best = vs[i]; } }
+    return ba >= 6000 ? best : null;
+  }
+  function relay(msg) {
+    var fr = document.getElementsByTagName('iframe');
+    for (var i = 0; i < fr.length; i++) { try { fr[i].contentWindow.postMessage(msg, '*'); } catch (e) {} }
+  }
+
+  function getCapture() {
+    var v = mainVideo();
+    if (!v || !v.captureStream) return null;
+    if (v === capVideo && capStream) return capStream;
+    capVideo = v;
+    try { capStream = v.captureStream(); } catch (e) { capStream = null; }
+    return capStream;
+  }
+
+  function attach(entry) {
+    var s = getCapture();
+    if (!s) return false;
+    var tracks = s.getTracks();
+    tracks.forEach(function (t) {
+      var sender = entry.senders[t.kind];
+      if (sender) { try { sender.replaceTrack(t); } catch (e) {} }
+      else { try { entry.senders[t.kind] = entry.pc.addTrack(t, s); } catch (e) {} }
+    });
+    return tracks.length > 0;
+  }
+
+  function tune(entry) {
+    try {
+      entry.pc.getSenders().forEach(function (sd) {
+        if (!sd.track || sd.track.kind !== 'video') return;
+        var p = sd.getParameters();
+        if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+        p.encodings[0].maxBitrate = 2500000;
+        var h = (capVideo && capVideo.videoHeight) || 720;
+        if (h > 720) p.encodings[0].scaleResolutionDownBy = h / 720;
+        sd.setParameters(p).catch(function () {});
+        try { sd.track.contentHint = 'motion'; } catch (e) {}
+      });
+    } catch (e) {}
+  }
+
+  function stop(id) {
+    var e = peers[id];
+    if (!e) return;
+    delete peers[id];
+    try { e.pc.close(); } catch (x) {}
+  }
+
+  function flushPending(entry) {
+    var list = entry.pending.splice(0);
+    list.forEach(function (c) { entry.pc.addIceCandidate(c).catch(function () {}); });
+  }
+
+  async function startFor(id) {
+    stop(id);
+    var pc = new RTCPeerConnection({ iceServers: ICE });
+    var entry = { pc: pc, senders: {}, pending: [], remote: false };
+    peers[id] = entry;
+    pc.onicecandidate = function (e) { if (e.candidate) post({ k: 'rtc', to: id, type: 'ice', data: e.candidate.toJSON ? e.candidate.toJSON() : e.candidate }); };
+    pc.onconnectionstatechange = function () {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') { if (peers[id] === entry) stop(id); }
+    };
+    if (!attach(entry)) {
+      stop(id);
+      post({ k: 'rtc', to: id, type: 'nostream' });
+      return;
+    }
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    tune(entry);
+    post({ k: 'rtc', to: id, type: 'offer', data: { type: offer.type, sdp: offer.sdp } });
+  }
+
+  function handleRtc(m) {
+    if (!m) return;
+    if (m.type === 'join') {
+      if (mainVideo()) startFor(m.from).catch(function () {});
+    } else if (m.type === 'answer') {
+      var e = peers[m.from];
+      if (e) {
+        e.pc.setRemoteDescription(m.data).then(function () { e.remote = true; flushPending(e); }).catch(function () {});
+      }
+    } else if (m.type === 'ice') {
+      var e2 = peers[m.from];
+      if (e2) {
+        if (e2.remote) e2.pc.addIceCandidate(m.data).catch(function () {});
+        else e2.pending.push(m.data);
+      }
+    } else if (m.type === 'leave') {
+      stop(m.from);
+    }
+  }
+
+  window.__coRtcIn = function (m) { handleRtc(m); relay({ __co: 3, m: m }); };
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (d && typeof d === 'object' && d.__co === 3 && d.m) { handleRtc(d.m); relay(d); }
+  }, false);
+
+  // Видео сменилось (новая серия, реклама): подставляем новые дорожки уже подключённым зрителям.
+  function onVideoChange(e) {
+    var v = e.target;
+    if (!v || v.tagName !== 'VIDEO' || v !== mainVideo()) return;
+    if (Object.keys(peers).length === 0) return;
+    if (v !== capVideo) { capVideo = null; capStream = null; }
+    Object.keys(peers).forEach(function (id) { attach(peers[id]); });
+  }
+  ['loadedmetadata', 'playing'].forEach(function (n) { document.addEventListener(n, onVideoChange, true); });
+})();
+
 (function () {
   // Внутри официального плеера YouTube синхронизацией занимается его собственный API (yt.html).
   if (window.__coYt) return;
+  try { if (location.hostname === 'cobrowser.app') return; } catch (e) {}
   try {
     if (/(^|\.)youtube(-nocookie)?\.com$/.test(location.hostname) && /^\/embed\//.test(location.pathname)) return;
   } catch (e) {}
@@ -230,7 +371,7 @@
   // Сообщаем приложению, какое видео играет (адрес источника), чтобы зритель включил тот же поток.
   function reportSrc(v) {
     var d = v.duration;
-    if (isFinite(d) && d < 90) return; // рекламу и превью пропускаем
+    if (isFinite(d) && d < 20) return; // короткие превью пропускаем
     post({ k: 'src', url: v.currentSrc || v.src || '', dur: isFinite(d) ? d : 0, page: location.href });
   }
   ['loadedmetadata', 'durationchange'].forEach(function (n) {
@@ -244,6 +385,6 @@
   // Раз в 5 секунд сообщаем позицию — приложение решает, рассылать ли её.
   setInterval(function () {
     var v = mainVideo();
-    if (v && !v.paused && Date.now() > suppressUntil) post({ k: 'pos', time: v.currentTime });
+    if (v && !v.paused && Date.now() > suppressUntil) post({ k: 'pos', time: v.currentTime, dur: isFinite(v.duration) ? v.duration : 0 });
   }, 5000);
 })();

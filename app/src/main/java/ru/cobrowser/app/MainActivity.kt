@@ -3,6 +3,7 @@ package ru.cobrowser.app
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
@@ -14,6 +15,9 @@ import android.graphics.Paint
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -142,6 +146,13 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private var streamFull = false
     private var videoW = 0
     private var videoH = 0
+    // --- режим «один плеер»: у главного настоящий плеер, зрители получают его картинку по WebRTC ---
+    private var liveOn = false
+    private var liveMode = false
+    private var mediaDur = 0.0
+    private var rtcFailedUrl: String? = null
+    private var viewerTemplate: String? = null
+    private val USE_YT_EMBED = false
     private var ytFor: String? = null
     private var ytFailedId: String? = null
     private var ytTemplate: String? = null
@@ -175,7 +186,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private val uiTick = object : Runnable {
         override fun run() {
             updateStreamControls()
-            if (player != null) handler.postDelayed(this, 500)
+            if (player != null || liveMode) handler.postDelayed(this, 500)
         }
     }
     private var lastManifestUrl: String? = null
@@ -382,6 +393,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         }
         col.addView(sw, lp(32))
         col.addView(button("Свои домены для прямого маршрута", 0xFF2A2A3A.toInt()) { editRouteDomains() }, lp(10))
+        col.addView(button("Проверить маршрутизацию", 0xFF2A2A3A.toInt()) { checkRouting() }, lp(10))
 
         val sv = ScrollView(this)
         sv.setBackgroundColor(BG)
@@ -475,8 +487,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
         controlsBar.addView(seekBar, LinearLayout.LayoutParams(0, WRAP, 1f))
         controlsBar.addView(timeText)
         controlsBar.visibility = View.GONE
-        playerHolder.addView(controlsBar, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
         content.addView(playerHolder, FrameLayout.LayoutParams(MATCH, MATCH))
+        content.addView(controlsBar, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
 
         chatPanel = buildChat()
         chatPanel.visibility = View.GONE
@@ -673,6 +685,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                 if (url == null || !url.startsWith("http")) return
                 // служебные адреса нашей страницы с плеером YouTube не считаем переходом
+                if (url.startsWith("https://cobrowser.app")) return
                 if (ytFor != null && (url == "https://www.youtube.com/" || url == "https://www.youtube.com")) return
                 val yt = youtubeId(url)
                 if (yt == null) {
@@ -828,7 +841,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     // Следящий видит экран управляющего и не может случайно «сломать» страницу своими нажатиями.
     private fun updateShield() {
-        val on = roomCode != null && !amController() && mirrorLock && web.visibility == View.VISIBLE
+        val on = roomCode != null && !amController() && mirrorLock && web.visibility == View.VISIBLE && !liveMode
         shield.visibility = if (on) View.VISIBLE else View.GONE
         pinBtn.text = if (amController()) "📍" else if (mirrorLock) "🔒" else "🔓"
     }
@@ -938,6 +951,10 @@ class MainActivity : Activity(), SyncBridge.Callback {
         mediaKnown = false
         controllerSeen = false
         ownerSeen = false
+        liveOn = false
+        liveMode = false
+        rtcFailedUrl = null
+        mediaDur = 0.0
         ownerUrl = ""
         pickingUntil = 0L
         handler.removeCallbacks(stateBeat)
@@ -1107,6 +1124,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     }
 
     private fun youtubeId(url: String): Pair<String, Int>? {
+        if (!USE_YT_EMBED) return null
         return try {
             val u = Uri.parse(url)
             val host = (u.host ?: return null).lowercase(Locale.ROOT)
@@ -1185,6 +1203,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         mediaTime = 0.0
         mediaKnown = false
         lastScroll = -1.0
+        liveOn = false
         streamUrl = null
         streamFailedUrl = null
         mediaAt = System.currentTimeMillis()
@@ -1239,30 +1258,63 @@ class MainActivity : Activity(), SyncBridge.Callback {
         }
     }
 
-    // Страница сообщила, что в ней играет длинное видео: запоминаем источник и рассылаем зрителям.
+    // Главный сообщил, что на странице играет видео: зрители начнут получать его картинку и звук.
     private fun onPageSrc(o: JSONObject) {
         if (!amOwner() || roomCode == null) return
-        val url = o.optString("url")
-        val page = o.optString("page")
-        var chosen: String? = null
-        if (url.startsWith("http://") || url.startsWith("https://")) {
-            chosen = url
-        } else if (lastManifestUrl != null && now() - lastManifestAt < 180000) {
-            chosen = lastManifestUrl
-        } else if (lastFileUrl != null && now() - lastFileAt < 180000) {
-            chosen = lastFileUrl
+        if (!liveOn) {
+            liveOn = true
+            sendMsg(JSONObject().put("t", "live").put("on", true))
         }
-        if (chosen == null || chosen == streamUrl) return
-        val h = mediaReq[chosen]
-        val ref = h?.first ?: (if (page.startsWith("http")) page else currentUrl)
-        val org = h?.second ?: originOf(ref)
-        streamUrl = chosen
-        streamRef = ref
-        streamOrigin = org
-        sendMsg(
-            JSONObject().put("t", "src").put("url", chosen)
-                .put("ref", ref).put("org", org ?: "")
-        )
+    }
+
+    private fun startLive() {
+        if (amOwner() || roomCode == null || liveMode || now() < pickingUntil) return
+        if (ownerUrl.isNotEmpty() && rtcFailedUrl == ownerUrl) return
+        var tpl = viewerTemplate
+        if (tpl == null) {
+            tpl = assets.open("viewer.html").bufferedReader().use { it.readText() }
+            viewerTemplate = tpl
+        }
+        liveMode = true
+        ytFor = null
+        pickerScroll.visibility = View.GONE
+        web.visibility = View.VISIBLE
+        web.loadDataWithBaseURL("https://cobrowser.app/", tpl, "text/html", "UTF-8", null)
+        updateShield()
+        handler.removeCallbacks(uiTick)
+        handler.post(uiTick)
+        toastSoon("Смотрим вместе. Управляет " + nameOf(controllerId))
+    }
+
+    private fun stopLive() {
+        if (!liveMode) return
+        liveMode = false
+        val u = ownerUrl
+        if (u.startsWith("http")) {
+            suppressedUrl = u
+            showWeb()
+            loadAny(u)
+        }
+    }
+
+    // Не вышло получить картинку (защита видео или нет связи): показываем обычную страницу.
+    private fun onRtcFail() {
+        if (!liveMode) return
+        rtcFailedUrl = ownerUrl
+        toastSoon("Трансляция этого видео недоступна, показываю страницу")
+        stopLive()
+    }
+
+    // Служебные сообщения WebRTC идут между страницей главного и страницей зрителя через общий канал.
+    private fun onRtcFromPage(o: JSONObject) {
+        if (roomCode == null) return
+        val type = o.optString("type")
+        if (type != "join" && type != "offer" && type != "answer" && type != "ice" && type != "nostream" && type != "leave") return
+        val to = if (amOwner()) o.optString("to") else hostId
+        if (to.isEmpty()) return
+        val m = JSONObject().put("t", "rtc").put("type", type).put("to", to)
+        if (o.has("data")) m.put("data", o.get("data"))
+        sendMsg(m)
     }
 
     private fun applySrc(o: JSONObject): Boolean {
@@ -1372,6 +1424,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     }
 
     private fun leaveStream() {
+        liveMode = false
         releasePlayer()
         if (this::playerHolder.isInitialized) playerHolder.visibility = View.GONE
         if (streamFull) toggleStreamFullscreen()
@@ -1421,6 +1474,11 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     private fun onHomeClick() {
         if (amController() || controllerId.isEmpty()) {
+            if (amController() && !amOwner() && liveMode) {
+                pickingUntil = now() + 60000
+                liveMode = false
+                web.loadUrl("about:blank")
+            }
             if (amController() && !amOwner() && player != null) {
                 // выбираем другой сайт: на время прячем плеер, главный откроет страницу для всех
                 pickingUntil = now() + 60000
@@ -1442,12 +1500,19 @@ class MainActivity : Activity(), SyncBridge.Callback {
     }
 
     private fun onPlayPauseClick() {
-        val p = player ?: return
         if (!amController() || amOwner()) return
-        sendMsg(
-            JSONObject().put("t", "cmd").put("a", if (p.playWhenReady) "pause" else "play")
-                .put("time", p.currentPosition / 1000.0)
-        )
+        val p = player
+        if (p != null) {
+            sendMsg(
+                JSONObject().put("t", "cmd").put("a", if (p.playWhenReady) "pause" else "play")
+                    .put("time", p.currentPosition / 1000.0)
+            )
+        } else if (liveMode) {
+            sendMsg(
+                JSONObject().put("t", "cmd").put("a", if (mediaPlaying) "pause" else "play")
+                    .put("time", currentMediaTime())
+            )
+        }
     }
 
     private fun fmtTime(ms: Long): String {
@@ -1462,15 +1527,25 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private fun updateStreamControls() {
         if (!this::controlsBar.isInitialized) return
         val p = player
-        val show = p != null && amController() && !amOwner()
-        controlsBar.visibility = if (show) View.VISIBLE else View.GONE
-        if (p == null || !show) return
-        val dur = p.duration
-        val pos = p.currentPosition
-        if (dur != C.TIME_UNSET && dur > 0) seekBar.max = (dur / 1000).toInt()
-        if (!seeking) seekBar.progress = (pos / 1000).toInt()
-        playPauseBtn.text = if (p.playWhenReady) "⏸" else "▶"
-        timeText.text = fmtTime(pos) + (if (dur != C.TIME_UNSET && dur > 0) " / " + fmtTime(dur) else "")
+        val canDrive = amController() && !amOwner()
+        val showExo = p != null && canDrive
+        val showLive = liveMode && canDrive
+        controlsBar.visibility = if (showExo || showLive) View.VISIBLE else View.GONE
+        if (showExo && p != null) {
+            val dur = p.duration
+            val pos = p.currentPosition
+            if (dur != C.TIME_UNSET && dur > 0) seekBar.max = (dur / 1000).toInt()
+            if (!seeking) seekBar.progress = (pos / 1000).toInt()
+            playPauseBtn.text = if (p.playWhenReady) "⏸" else "▶"
+            timeText.text = fmtTime(pos) + (if (dur != C.TIME_UNSET && dur > 0) " / " + fmtTime(dur) else "")
+        } else if (showLive) {
+            val pos = (currentMediaTime() * 1000).toLong()
+            val dur = (mediaDur * 1000).toLong()
+            if (dur > 0) seekBar.max = (dur / 1000).toInt()
+            if (!seeking) seekBar.progress = (pos / 1000).toInt()
+            playPauseBtn.text = if (mediaPlaying) "⏸" else "▶"
+            timeText.text = fmtTime(pos) + (if (dur > 0) " / " + fmtTime(dur) else "")
+        }
     }
 
     // ============================== маршрутизация РФ ==============================
@@ -1497,6 +1572,74 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }
             .setNegativeButton("Отмена", null)
             .show()
+    }
+
+    // Узнаём, пускает ли VPN приложение в обход себя: сравниваем внешний IP «обычным путём» и «напрямую».
+    private fun checkRouting() {
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Проверка маршрутизации")
+            .setMessage("Проверяю, подожди несколько секунд…")
+            .setPositiveButton("Закрыть", null)
+            .show()
+        thread {
+            var vpn = false
+            var phys: Network? = null
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                @Suppress("DEPRECATION")
+                for (n in cm.allNetworks) {
+                    val caps = cm.getNetworkCapabilities(n) ?: continue
+                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                        vpn = true
+                    } else if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    ) {
+                        if (phys == null || caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) phys = n
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            val ipDefault = fetchIp(null)
+            val ipDirect = if (phys != null) fetchIp(phys) else null
+            val proxyOk = WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)
+            val on = prefs.getBoolean("route_ru", true)
+
+            val sb = StringBuilder()
+            sb.append("Маршрутизация РФ: ").append(if (on) "включена" else "выключена").append("\n")
+            sb.append("Перенаправление в WebView: ").append(if (proxyOk) "поддерживается" else "не поддерживается этой версией WebView").append("\n")
+            sb.append("VPN на телефоне: ").append(if (vpn) "обнаружен" else "не обнаружен").append("\n\n")
+            sb.append("IP обычным путём: ").append(ipDefault ?: "не удалось узнать").append("\n")
+            sb.append("IP напрямую (мимо VPN): ").append(ipDirect ?: "не удалось узнать").append("\n\n")
+            if (ipDefault == null) {
+                sb.append("Нет доступа в интернет или сервис проверки недоступен.")
+            } else if (!vpn) {
+                sb.append("VPN не найден: все сайты и так ходят напрямую.")
+            } else if (ipDirect != null && ipDirect != ipDefault) {
+                sb.append("✅ Обход работает. Российские сайты увидят твой настоящий IP (").append(ipDirect).append("), остальные пойдут через VPN.")
+            } else {
+                sb.append("❌ Твой VPN не разрешает приложениям обходить его: весь трафик всё равно уходит в туннель, поэтому российские сайты видят иностранный IP.\n\n")
+                sb.append("Это нельзя исправить внутри приложения. Что можно сделать в самом VPN-приложении:\n")
+                sb.append("1) включить раздельное туннелирование / маршрутизацию: российские сайты (домены .ru, geoip RU) — напрямую, мимо VPN;\n")
+                sb.append("2) или добавить CoBrowser в исключения VPN (тогда всё приложение пойдёт напрямую, а YouTube без VPN может не открываться).")
+            }
+            runOnUiThread { dlg.setMessage(sb.toString()) }
+        }
+    }
+
+    private fun fetchIp(net: Network?): String? {
+        val urls = listOf("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
+        for (u in urls) {
+            try {
+                val url = URL(u)
+                val conn = if (net != null) net.openConnection(url) else url.openConnection(java.net.Proxy.NO_PROXY)
+                conn.connectTimeout = 6000
+                conn.readTimeout = 6000
+                val text = conn.getInputStream().bufferedReader().use { it.readText() }.trim()
+                if (text.length in 7..45) return text
+            } catch (e: Exception) {
+            }
+        }
+        return null
     }
 
     // Российские сайты ходят напрямую (мимо VPN), остальные — как обычно.
@@ -1562,14 +1705,21 @@ class MainActivity : Activity(), SyncBridge.Callback {
             when (o.optString("k")) {
                 "media" -> onLocalMedia(o.optString("a"), o.optDouble("time", 0.0))
                 "pos" -> {
+                    val dd = o.optDouble("dur", 0.0)
+                    if (dd > 0) mediaDur = dd
                     if (amOwner() && mediaPlaying && roomCode != null) {
                         mediaTime = o.optDouble("time", 0.0)
                         mediaAt = now()
-                        sendMsg(JSONObject().put("t", "media").put("a", "tick").put("time", mediaTime))
+                        sendMsg(
+                            JSONObject().put("t", "media").put("a", "tick").put("time", mediaTime)
+                                .put("dur", mediaDur)
+                        )
                     }
                 }
                 "ready" -> onVideoReady()
                 "ytError" -> onYtError()
+                "rtc" -> onRtcFromPage(o)
+                "rtcFail" -> onRtcFail()
                 "src" -> onPageSrc(o)
                 "ui" -> onLocalUi(o)
                 "blocked" -> toastSoon("Нажми ▶ в плеере, чтобы включить видео")
@@ -1649,6 +1799,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
             o.put("media", JSONObject().put("playing", mediaPlaying).put("time", currentMediaTime()))
         }
         if (lastScroll >= 0) o.put("sy", lastScroll)
+        o.put("live", liveOn)
+        if (mediaDur > 0) o.put("dur", mediaDur)
         val su = streamUrl
         if (su != null) {
             o.put("src", JSONObject().put("url", su).put("ref", streamRef ?: "").put("org", streamOrigin ?: ""))
@@ -1698,6 +1850,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
         if (c.isNotEmpty() && c != controllerId) setController(c, false)
         val url = o.optString("url")
         val srcObj = o.optJSONObject("src")
+        val live = o.optBoolean("live")
+        val dd = o.optDouble("dur", 0.0)
+        if (dd > 0) mediaDur = dd
         val m = o.optJSONObject("media")
         if (m != null) {
             mediaPlaying = m.optBoolean("playing")
@@ -1713,6 +1868,12 @@ class MainActivity : Activity(), SyncBridge.Callback {
             // главный перешёл на другую страницу (или мы только вошли)
             ownerUrl = url
             if (m != null) pendingCmd = Triple(if (mediaPlaying) "play" else "pause", mediaTime, now())
+            if (live && rtcFailedUrl != url && now() >= pickingUntil) {
+                leaveStream()
+                currentUrl = url
+                startLive()
+                return
+            }
             if (srcObj != null && applySrc(srcObj)) {
                 currentUrl = url
                 startStream()
@@ -1723,6 +1884,11 @@ class MainActivity : Activity(), SyncBridge.Callback {
             return
         }
         // та же страница: подтягиваем только расхождения
+        if (live && !liveMode && rtcFailedUrl != url) {
+            startLive()
+        } else if (!live && liveMode) {
+            stopLive()
+        }
         if (srcObj != null) {
             if (applySrc(srcObj) || (player == null && streamUrl != streamFailedUrl)) startStream()
         } else if (player != null) {
@@ -2058,14 +2224,31 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 }
                 "media" -> {
                     if (!fromOwner(from) || amOwner()) return
+                    val dd = o.optDouble("dur", 0.0)
+                    if (dd > 0) mediaDur = dd
                     remoteMedia(o.optString("a"), o.optDouble("time", 0.0))
+                }
+                "live" -> {
+                    if (!fromOwner(from) || amOwner()) return
+                    if (o.optBoolean("on")) startLive() else stopLive()
+                }
+                "rtc" -> {
+                    if (o.optString("to") != myId) return
+                    if (!amOwner() && from != hostId) return
+                    val msg = JSONObject().put("type", o.optString("type")).put("from", from)
+                    if (o.has("data")) msg.put("data", o.get("data"))
+                    if (amOwner()) {
+                        web.evaluateJavascript("window.__coRtcIn&&window.__coRtcIn(" + msg.toString() + ")", null)
+                    } else if (liveMode) {
+                        web.evaluateJavascript("window.__rtcIn&&window.__rtcIn(" + msg.toString() + ")", null)
+                    }
                 }
                 "src" -> {
                     if (!fromOwner(from) || amOwner()) return
                     if (applySrc(o)) startStream()
                 }
                 "ui" -> {
-                    if (player != null || amOwner() || !fromOwner(from)) return
+                    if (player != null || liveMode || amOwner() || !fromOwner(from)) return
                     if (o.optString("by") == myId) return
                     val c = cleanUi(o) ?: return
                     if (c.optString("e") == "scroll") lastScroll = c.optDouble("y", 0.0)
