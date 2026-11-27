@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #p { position: absolute; left: 0; top: 0; width: 100%; height: 100%; border: 0; }
+</style>
+</head>
+<body>
+<div id="p"></div>
+<script>
+window.__coYt = true;
+(function () {
+  var VID = '__VIDEO_ID__';
+  var START = __START__;
+  var player = null, ready = false;
+  var suppressUntil = 0, lastCmd = null, lastCmdAt = 0, applied = true, last = null, lastTick = 0;
+
+  function post(o) {
+    try {
+      var s = JSON.stringify(o);
+      if (window.CoBridge && window.CoBridge.postMessage) window.CoBridge.postMessage(s);
+      else if (window.CoNative && window.CoNative.postEvent) window.CoNative.postEvent(s);
+    } catch (e) {}
+  }
+  function cur() { try { return player.getCurrentTime() || 0; } catch (e) { return 0; } }
+  function isPlaying() { try { return player.getPlayerState() === 1; } catch (e) { return false; } }
+
+  // Те же команды, что и у обычных страниц: play / pause / seek / tick (подстройка времени).
+  function tryApply() {
+    if (!ready || !lastCmd || applied) return;
+    var age = (Date.now() - lastCmdAt) / 1000;
+    var c = lastCmd;
+    var t = (c.time || 0) + ((c.a === 'play' || c.a === 'tick') ? age : 0);
+    var now = cur();
+    suppressUntil = Date.now() + 1500;
+    last = null;
+    try {
+      if (c.a === 'pause') {
+        player.pauseVideo();
+        if (Math.abs(now - t) > 0.5) player.seekTo(t, true);
+      } else if (c.a === 'play') {
+        if (Math.abs(now - t) > 0.7) player.seekTo(t, true);
+        player.playVideo();
+      } else if (c.a === 'seek') {
+        player.seekTo(t, true);
+      } else if (c.a === 'tick') {
+        if (Math.abs(now - t) > 2) player.seekTo(t, true);
+        if (!isPlaying()) player.playVideo();
+      }
+    } catch (e) {}
+    applied = true;
+  }
+
+  window.__coCmd = function (c) { lastCmd = c; lastCmdAt = Date.now(); applied = false; tryApply(); };
+  window.__coUi = function () {};
+
+  function startPoll() {
+    setInterval(function () {
+      if (!ready) return;
+      var now = Date.now(), t = cur(), pl = isPlaying();
+      if (last && now > suppressUntil) {
+        var exp = last.pl ? last.t + (now - last.at) / 1000 : last.t;
+        if (Math.abs(t - exp) > 1.5) post({ k: 'media', a: 'seek', time: t });
+      }
+      last = { t: t, at: now, pl: pl };
+      if (pl && now > suppressUntil && now - lastTick > 5000) {
+        lastTick = now;
+        post({ k: 'pos', time: t });
+      }
+    }, 500);
+  }
+
+  window.onYouTubeIframeAPIReady = function () {
+    player = new YT.Player('p', {
+      width: '100%', height: '100%', videoId: VID,
+      playerVars: { playsinline: 1, rel: 0, enablejsapi: 1, fs: 1, start: START, origin: 'https://www.youtube.com' },
+      events: {
+        onReady: function () {
+          ready = true;
+          try { player.unMute(); player.setVolume(100); } catch (e) {}
+          post({ k: 'ready' });
+          tryApply();
+          startPoll();
+        },
+        onStateChange: function (e) {
+          if (!ready || Date.now() < suppressUntil) return;
+          if (e.data === 1) post({ k: 'media', a: 'play', time: cur() });
+          else if (e.data === 2) post({ k: 'media', a: 'pause', time: cur() });
+        },
+        onError: function (e) { post({ k: 'ytError', code: e.data }); }
+      }
+    });
+  };
+
+  var s = document.createElement('script');
+  s.src = 'https://www.youtube.com/iframe_api';
+  s.onerror = function () { post({ k: 'ytError', code: -1 }); };
+  document.head.appendChild(s);
+})();
+</script>
+</body>
+</html>

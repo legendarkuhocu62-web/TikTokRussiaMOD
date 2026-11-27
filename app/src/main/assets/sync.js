@@ -1,4 +1,9 @@
 (function () {
+  // Внутри официального плеера YouTube синхронизацией занимается его собственный API (yt.html).
+  if (window.__coYt) return;
+  try {
+    if (/(^|\.)youtube(-nocookie)?\.com$/.test(location.hostname) && /^\/embed\//.test(location.pathname)) return;
+  } catch (e) {}
   if (window.__coInstalled) return;
   window.__coInstalled = true;
 
