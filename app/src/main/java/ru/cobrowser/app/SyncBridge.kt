@@ -3,6 +3,7 @@ package ru.cobrowser.app
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONObject
@@ -19,6 +20,7 @@ class SyncBridge(private val activity: Activity, private val cb: Callback) {
         fun onPeople(json: String)
         fun onStatus(status: String)
         fun onReady()
+        fun onBridgeGone()
     }
 
     val view: WebView = WebView(activity)
@@ -37,6 +39,11 @@ class SyncBridge(private val activity: Activity, private val cb: Callback) {
         view.settings.domStorageEnabled = true
         view.addJavascriptInterface(Api(), "Android")
         view.webViewClient = object : WebViewClient() {
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                activity.runOnUiThread { cb.onBridgeGone() }
+                return true
+            }
+
             override fun onPageFinished(v: WebView?, url: String?) {
                 pageLoaded = true
                 for (js in pendingJs) v?.evaluateJavascript(js, null)

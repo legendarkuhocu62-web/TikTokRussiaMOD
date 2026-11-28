@@ -6,16 +6,19 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #v { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #st { position: absolute; left: 6px; bottom: 4px; color: #6b6b85; font: 11px sans-serif; }
   #msg { position: absolute; left: 0; right: 0; top: 45%; text-align: center; color: #cfcfe6; font: 16px sans-serif; padding: 0 24px; }
 </style>
 </head>
 <body>
 <video id="v" autoplay playsinline></video>
 <div id="msg">Подключаем трансляцию…</div>
+<div id="st"></div>
 <script>
 (function () {
   var v = document.getElementById('v'), msg = document.getElementById('msg');
-  var pc = null, pending = [], remoteSet = false, joinT = null;
+  var pc = null, pending = [], remoteSet = false, joinT = null, discT = null, nostream = 0;
+  var st = document.getElementById('st');
   var ICE = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -44,7 +47,7 @@
     try {
       if (m.type === 'offer') {
         if (pc) { try { pc.close(); } catch (e) {} }
-        pending = []; remoteSet = false;
+        pending = []; remoteSet = false; nostream = 0;
         pc = new RTCPeerConnection({ iceServers: ICE });
         var mine = pc;
         pc.onicecandidate = function (e) {
@@ -58,10 +61,19 @@
         };
         pc.onconnectionstatechange = function () {
           if (mine !== pc) return;
-          var st = pc.connectionState;
-          if (st === 'failed' || st === 'disconnected') {
+          var cs = pc.connectionState;
+          if (cs === 'connected') {
+            clearTimeout(discT);
+            if (v.videoWidth > 0) msg.style.display = 'none';
+          } else if (cs === 'disconnected') {
+            // короткие провалы не показываем: ждём 4 секунды
+            clearTimeout(discT);
+            discT = setTimeout(function () {
+              if (pc === mine && pc.connectionState !== 'connected') { show('Связь потеряна, переподключаем…'); join(); }
+            }, 4000);
+          } else if (cs === 'failed') {
             show('Связь потеряна, переподключаем…');
-            setTimeout(join, 1500);
+            setTimeout(join, 800);
           }
         };
         await pc.setRemoteDescription(m.data);
@@ -75,8 +87,15 @@
         if (pc && remoteSet) { try { await pc.addIceCandidate(m.data); } catch (e) {} }
         else pending.push(m.data);
       } else if (m.type === 'nostream') {
-        show('Это видео нельзя транслировать');
-        post({ k: 'rtcFail' });
+        // у главного ещё нет готового видео: ждём и просим снова (до ~30 секунд)
+        nostream++;
+        if (nostream > 10) {
+          show('Это видео нельзя транслировать');
+          post({ k: 'rtcFail' });
+        } else {
+          show('Ждём видео…');
+          setTimeout(join, 3000);
+        }
       }
     } catch (e) {}
   };
@@ -86,6 +105,10 @@
     var f = v.requestFullscreen || v.webkitRequestFullscreen;
     if (f) { try { f.call(v); } catch (e) {} }
   });
+  setInterval(function () {
+    st.textContent = (pc ? pc.connectionState : '—') + (v.videoWidth ? ' ' + v.videoWidth + 'x' + v.videoHeight : '');
+    if (v.videoWidth > 0 && pc && pc.connectionState === 'connected') msg.style.display = 'none';
+  }, 1000);
   join();
 })();
 </script>

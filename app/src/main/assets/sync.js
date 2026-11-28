@@ -23,8 +23,22 @@
     } catch (e) {}
   }
   function area(v) { try { var r = v.getBoundingClientRect(); return r.width * r.height; } catch (e) { return 0; } }
+  function allVideos() {
+    var out = Array.prototype.slice.call(document.getElementsByTagName('video'));
+    if (out.length === 0) {
+      // плеер может быть спрятан в shadow DOM
+      try {
+        var all = document.getElementsByTagName('*');
+        for (var i = 0; i < all.length && i < 5000; i++) {
+          var sr = all[i].shadowRoot;
+          if (sr) { var vs = sr.querySelectorAll('video'); for (var j = 0; j < vs.length; j++) out.push(vs[j]); }
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
   function mainVideo() {
-    var vs = document.getElementsByTagName('video'), best = null, ba = 0;
+    var vs = allVideos(), best = null, ba = 0;
     for (var i = 0; i < vs.length; i++) { var a = area(vs[i]); if (a > ba) { ba = a; best = vs[i]; } }
     return ba >= 6000 ? best : null;
   }
@@ -60,9 +74,10 @@
         if (!sd.track || sd.track.kind !== 'video') return;
         var p = sd.getParameters();
         if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-        p.encodings[0].maxBitrate = 2500000;
-        var h = (capVideo && capVideo.videoHeight) || 720;
-        if (h > 720) p.encodings[0].scaleResolutionDownBy = h / 720;
+        p.encodings[0].maxBitrate = 1500000;
+        p.encodings[0].maxFramerate = 24;
+        var h = (capVideo && capVideo.videoHeight) || 540;
+        if (h > 540) p.encodings[0].scaleResolutionDownBy = h / 540;
         sd.setParameters(p).catch(function () {});
         try { sd.track.contentHint = 'motion'; } catch (e) {}
       });
@@ -164,8 +179,22 @@
     try { var r = v.getBoundingClientRect(); return r.width * r.height; } catch (e) { return 0; }
   }
 
+  function allVideos() {
+    var out = Array.prototype.slice.call(document.getElementsByTagName('video'));
+    if (out.length === 0) {
+      // плеер может быть спрятан в shadow DOM
+      try {
+        var all = document.getElementsByTagName('*');
+        for (var i = 0; i < all.length && i < 5000; i++) {
+          var sr = all[i].shadowRoot;
+          if (sr) { var vs = sr.querySelectorAll('video'); for (var j = 0; j < vs.length; j++) out.push(vs[j]); }
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
   function mainVideo() {
-    var vs = document.getElementsByTagName('video'), best = null, ba = 0;
+    var vs = allVideos(), best = null, ba = 0;
     for (var i = 0; i < vs.length; i++) {
       var a = area(vs[i]);
       if (a > ba) { ba = a; best = vs[i]; }
@@ -391,9 +420,68 @@
     }, true);
   });
 
+  // Страховка: раз в 1,5 секунды ищем играющее видео сами (если события до нас не дошли).
+  var hookedVideos = typeof WeakSet === 'function' ? new WeakSet() : null;
+  var lastReported = null;
+  function hookShadowVideo(v) {
+    if (!hookedVideos || hookedVideos.has(v)) return;
+    hookedVideos.add(v);
+    var root = v.getRootNode ? v.getRootNode() : null;
+    if (!root || !root.host) return; // обычные видео уже ловятся на уровне документа
+    ['play', 'pause', 'seeked'].forEach(function (n) { v.addEventListener(n, onMedia, true); });
+    ['loadedmetadata', 'playing', 'play'].forEach(function (n) { v.addEventListener(n, onReadyEv, true); });
+    ['loadedmetadata', 'durationchange', 'playing'].forEach(function (n) {
+      v.addEventListener(n, function () { if (area(v) >= MIN_AREA) reportSrc(v); }, true);
+    });
+  }
+  setInterval(function () {
+    var v = mainVideo();
+    if (!v) return;
+    hookShadowVideo(v);
+    if (!v.paused && !v.ended && v.readyState >= 2 && v !== lastReported) {
+      lastReported = v;
+      reportSrc(v);
+    }
+  }, 1500);
+
   // Раз в 5 секунд сообщаем позицию — приложение решает, рассылать ли её.
   setInterval(function () {
     var v = mainVideo();
     if (v && !v.paused && Date.now() > suppressUntil) post({ k: 'pos', time: v.currentTime, dur: isFinite(v.duration) ? v.duration : 0 });
   }, 5000);
+})();
+
+// ===== Диагностика: что видит скрипт в каждом кадре страницы =====
+(function () {
+  try { if (location.hostname === 'cobrowser.app') return; } catch (e) {}
+  if (window.__coDiagInstalled) return;
+  window.__coDiagInstalled = true;
+  function info() {
+    var vs = document.getElementsByTagName('video'), arr = [];
+    for (var i = 0; i < vs.length && i < 5; i++) {
+      var v = vs[i], r = v.getBoundingClientRect();
+      arr.push({ w: Math.round(r.width), h: Math.round(r.height), paused: v.paused, rs: v.readyState,
+        src: (v.currentSrc || '').slice(0, 50), cors: !!v.crossOrigin });
+    }
+    var loc = '';
+    try { loc = location.hostname + location.pathname.slice(0, 30); } catch (e) {}
+    return { k: 'diag', loc: loc, top: window === window.top, iframes: document.getElementsByTagName('iframe').length,
+      bridge: !!(window.CoBridge || window.CoNative), videos: arr };
+  }
+  function send() {
+    try {
+      var s = JSON.stringify(info());
+      if (window.CoBridge && window.CoBridge.postMessage) window.CoBridge.postMessage(s);
+      else if (window.CoNative && window.CoNative.postEvent) window.CoNative.postEvent(s);
+    } catch (e) {}
+  }
+  function relay(msg) {
+    var fr = document.getElementsByTagName('iframe');
+    for (var i = 0; i < fr.length; i++) { try { fr[i].contentWindow.postMessage(msg, '*'); } catch (e) {} }
+  }
+  window.__coDiag = function () { send(); relay({ __co: 4 }); };
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (d && typeof d === 'object' && d.__co === 4) { send(); relay(d); }
+  }, false);
 })();

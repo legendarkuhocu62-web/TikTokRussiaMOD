@@ -35,6 +35,7 @@ import android.view.inputmethod.EditorInfo
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -88,6 +89,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private lateinit var fullscreenHolder: FrameLayout
     private lateinit var web: WebView
     private lateinit var pickerScroll: View
+    private lateinit var contentFrame: FrameLayout
+    private val diagLines = ArrayList<String>()
     private lateinit var chatPanel: LinearLayout
     private lateinit var chatScroll: ScrollView
     private lateinit var roomLabel: TextView
@@ -151,6 +154,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private var liveMode = false
     private var mediaDur = 0.0
     private var rtcFailedUrl: String? = null
+    private var rtcFailedUntil = 0L
+    private var navAtMs = 0L
+    private var lastVideoAt = 0L
     private var viewerTemplate: String? = null
     private val USE_YT_EMBED = false
     private var ytFor: String? = null
@@ -182,6 +188,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }
         }
     }
+
+    private val noVideoCheck = Runnable { checkNoVideo() }
 
     private val uiTick = object : Runnable {
         override fun run() {
@@ -257,8 +265,10 @@ class MainActivity : Activity(), SyncBridge.Callback {
         if (roomLayout.visibility == View.VISIBLE) {
             if (chatPanel.visibility == View.VISIBLE) {
                 chatPanel.visibility = View.GONE
-            } else if (web.visibility == View.VISIBLE) {
-                if (web.canGoBack()) web.goBack() else showPicker()
+            } else if (pickerScroll.visibility == View.VISIBLE) {
+                if (web.visibility == View.VISIBLE && (currentUrl.startsWith("http") || liveMode)) showWeb() else confirmLeave()
+            } else if (web.visibility == View.VISIBLE && !liveMode && amController() && web.canGoBack()) {
+                web.goBack()
             } else {
                 confirmLeave()
             }
@@ -435,8 +445,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
         col.addView(bar, LinearLayout.LayoutParams(MATCH, dp(48)))
 
         val content = FrameLayout(this)
+        contentFrame = content
         pickerScroll = buildPicker()
-        content.addView(pickerScroll, FrameLayout.LayoutParams(MATCH, MATCH))
 
         web = createWebView()
         web.visibility = View.GONE
@@ -446,6 +456,8 @@ class MainActivity : Activity(), SyncBridge.Callback {
         shield.setOnTouchListener { _, _ -> true }
         shield.visibility = View.GONE
         content.addView(shield, FrameLayout.LayoutParams(MATCH, MATCH))
+        // меню выбора сервиса лежит ПОВЕРХ страницы: страница под ним продолжает работать и транслировать видео
+        content.addView(pickerScroll, FrameLayout.LayoutParams(MATCH, MATCH))
 
         playerHolder = FrameLayout(this)
         playerHolder.setBackgroundColor(Color.BLACK)
@@ -665,6 +677,12 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 return !(u.startsWith("http://") || u.startsWith("https://"))
             }
 
+            // Отрисовщик страницы упал (бывает на тяжёлых сайтах). Без этого обработчика Android закрывает всё приложение.
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                handler.post { recoverWeb() }
+                return true
+            }
+
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                 val r = request ?: return null
                 val url = r.url.toString()
@@ -735,6 +753,77 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }
         }
         return w
+    }
+
+    // Пересоздаёт упавшую страницу и открывает то, что было.
+    private fun recoverWeb() {
+        if (!this::contentFrame.isInitialized) return
+        val old = web
+        val idx = contentFrame.indexOfChild(old)
+        val wasLive = liveMode
+        try {
+            contentFrame.removeView(old)
+            old.destroy()
+        } catch (e: Exception) {
+        }
+        val fresh = createWebView()
+        web = fresh
+        contentFrame.addView(fresh, if (idx >= 0) idx else 0, FrameLayout.LayoutParams(MATCH, MATCH))
+        installScripts()
+        ytFor = null
+        liveMode = false
+        Toast.makeText(this, "Страница перезапущена после сбоя", Toast.LENGTH_SHORT).show()
+        if (roomCode == null) return
+        if (wasLive && !amOwner()) {
+            startLive()
+        } else if (currentUrl.startsWith("http")) {
+            suppressedUrl = currentUrl
+            fresh.visibility = View.VISIBLE
+            loadAny(currentUrl)
+        }
+    }
+
+    // Диагностика: какие кадры и видео видит скрипт на текущей странице главного.
+    private fun runDiag() {
+        diagLines.clear()
+        web.evaluateJavascript("window.__coDiag&&window.__coDiag()", null)
+        Toast.makeText(this, "Проверяю страницу…", Toast.LENGTH_SHORT).show()
+        handler.postDelayed({
+            val sb = StringBuilder()
+            sb.append("Страница: ").append(if (currentUrl.isEmpty()) "—" else currentUrl.take(60)).append("\n")
+            sb.append("Режим: ")
+                .append(if (liveOn) "живая картинка (📡)" else if (streamUrl != null) "прямой файл (🎞)" else "видео не найдено")
+                .append("\n\n")
+            if (diagLines.isEmpty()) {
+                sb.append("Скрипт на странице не ответил. Возможно, страница ещё грузится или в неё не удалось добавить скрипт.")
+            } else {
+                sb.append("Кадров с нашим скриптом: ").append(diagLines.size).append("\n")
+                for (l in diagLines) sb.append("• ").append(l).append("\n")
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Диагностика видео")
+                .setMessage(sb.toString())
+                .setPositiveButton("Закрыть", null)
+                .show()
+        }, 2000)
+    }
+
+    private fun onDiagEvent(o: JSONObject) {
+        val sb = StringBuilder()
+        sb.append(if (o.optBoolean("top")) "[основной] " else "[вложенный] ")
+        sb.append(o.optString("loc"))
+        sb.append(" · iframe: ").append(o.optInt("iframes"))
+        val vids = o.optJSONArray("videos")
+        if (vids == null || vids.length() == 0) {
+            sb.append(" · видео: нет")
+        } else {
+            for (i in 0 until vids.length()) {
+                val v = vids.getJSONObject(i)
+                sb.append(" · видео ").append(v.optInt("w")).append("x").append(v.optInt("h"))
+                    .append(if (v.optBoolean("paused")) " пауза" else " играет")
+            }
+        }
+        if (diagLines.size < 12) diagLines.add(sb.toString())
     }
 
     private fun installScripts() {
@@ -829,7 +918,6 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     private fun showPicker() {
         pickerScroll.visibility = View.VISIBLE
-        web.visibility = View.GONE
         updateShield()
     }
 
@@ -841,9 +929,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     // Следящий видит экран управляющего и не может случайно «сломать» страницу своими нажатиями.
     private fun updateShield() {
-        val on = roomCode != null && !amController() && mirrorLock && web.visibility == View.VISIBLE && !liveMode
+        val on = roomCode != null && !amController() && web.visibility == View.VISIBLE && !liveMode
         shield.visibility = if (on) View.VISIBLE else View.GONE
-        pinBtn.text = if (amController()) "📍" else if (mirrorLock) "🔒" else "🔓"
+        pinBtn.text = if (amController()) "📍" else "🔒"
     }
 
     private fun runRole() {
@@ -855,12 +943,9 @@ class MainActivity : Activity(), SyncBridge.Callback {
             pushNavToAll()
             return
         }
-        mirrorLock = !mirrorLock
-        updateShield()
         Toast.makeText(
             this,
-            if (mirrorLock) "Режим «смотрим вместе»: экран повторяет действия управляющего"
-            else "Свободный режим: можешь сам листать и нажимать",
+            "Сейчас управляет " + nameOf(controllerId) + ". Передать пульт можно в списке участников 👥",
             Toast.LENGTH_SHORT
         ).show()
     }
@@ -1205,9 +1290,11 @@ class MainActivity : Activity(), SyncBridge.Callback {
         mediaTime = 0.0
         mediaKnown = false
         lastScroll = -1.0
-        liveOn = false
-        streamUrl = null
         streamFailedUrl = null
+        // режим видео остаётся включённым: если на новой странице видео не появится за 8 секунд, зрителям скажем выключить его
+        navAtMs = now()
+        handler.removeCallbacks(noVideoCheck)
+        handler.postDelayed(noVideoCheck, 8000)
         mediaAt = System.currentTimeMillis()
         sendMsg(JSONObject().put("t", "nav").put("url", url).put("force", force))
     }
@@ -1262,8 +1349,21 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     // Главный сообщил, что на странице играет видео. Зрителям оно передаётся одним из двух способов:
     // живая картинка с плеера главного (WebRTC) или, если захват невозможен, прямой адрес файла.
+    private fun checkNoVideo() {
+        if (!amOwner() || roomCode == null) return
+        if ((liveOn || streamUrl != null) && lastVideoAt < navAtMs) {
+            liveOn = false
+            streamUrl = null
+            sendMsg(JSONObject().put("t", "live").put("on", false))
+            updateRoomLabel()
+        }
+    }
+
+    private fun rtcBlocked(u: String): Boolean = rtcFailedUrl == u && now() < rtcFailedUntil
+
     private fun onPageSrc(o: JSONObject) {
         if (!amOwner() || roomCode == null) return
+        lastVideoAt = now()
         val url = o.optString("url")
         val mode = o.optString("mode")
         if (mode == "direct" && (url.startsWith("http://") || url.startsWith("https://"))) {
@@ -1293,7 +1393,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     private fun startLive() {
         if (amOwner() || roomCode == null || liveMode || now() < pickingUntil) return
-        if (ownerUrl.isNotEmpty() && rtcFailedUrl == ownerUrl) return
+        if (ownerUrl.isNotEmpty() && rtcBlocked(ownerUrl)) return
         var tpl = viewerTemplate
         if (tpl == null) {
             tpl = assets.open("viewer.html").bufferedReader().use { it.readText() }
@@ -1327,6 +1427,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     private fun onRtcFail() {
         if (!liveMode) return
         rtcFailedUrl = ownerUrl
+        rtcFailedUntil = now() + 60000
         toastSoon("Трансляция этого видео недоступна, показываю страницу")
         stopLive()
     }
@@ -1734,6 +1835,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 "pos" -> {
                     val dd = o.optDouble("dur", 0.0)
                     if (dd > 0) mediaDur = dd
+                    if (amOwner()) lastVideoAt = now()
                     if (amOwner() && mediaPlaying && roomCode != null) {
                         mediaTime = o.optDouble("time", 0.0)
                         mediaAt = now()
@@ -1745,6 +1847,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 }
                 "ready" -> onVideoReady()
                 "ytError" -> onYtError()
+                "diag" -> onDiagEvent(o)
                 "rtc" -> onRtcFromPage(o)
                 "rtcFail" -> onRtcFail()
                 "src" -> onPageSrc(o)
@@ -1895,7 +1998,11 @@ class MainActivity : Activity(), SyncBridge.Callback {
             // главный перешёл на другую страницу (или мы только вошли)
             ownerUrl = url
             if (m != null) pendingCmd = Triple(if (mediaPlaying) "play" else "pause", mediaTime, now())
-            if (live && rtcFailedUrl != url && now() >= pickingUntil) {
+            if (live && liveMode) {
+                currentUrl = url
+                return
+            }
+            if (live && !rtcBlocked(url) && now() >= pickingUntil) {
                 leaveStream()
                 currentUrl = url
                 startLive()
@@ -1911,7 +2018,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
             return
         }
         // та же страница: подтягиваем только расхождения
-        if (live && !liveMode && rtcFailedUrl != url) {
+        if (live && !liveMode && !rtcBlocked(url)) {
             startLive()
         } else if (!live && liveMode && srcObj == null) {
             stopLive()
@@ -1997,6 +2104,12 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }, lp(12))
         }
         col.addView(button("Поделиться кодом комнаты", 0xFF2A2A3A.toInt()) { shareCode() }, lp(10))
+        if (amOwner()) {
+            col.addView(button("Диагностика видео", 0xFF2A2A3A.toInt()) {
+                membersDialog?.dismiss()
+                runDiag()
+            }, lp(10))
+        }
 
         val sv = ScrollView(this)
         sv.addView(col)
@@ -2165,6 +2278,22 @@ class MainActivity : Activity(), SyncBridge.Callback {
 
     // ============================== SyncBridge.Callback ==============================
 
+    override fun onBridgeGone() {
+        try {
+            rootLayout.removeView(bridge.view)
+            bridge.destroy()
+        } catch (e: Exception) {
+        }
+        bridge = SyncBridge(this, this)
+        rootLayout.addView(bridge.view, FrameLayout.LayoutParams(1, 1))
+        val code = roomCode
+        if (code != null) {
+            connStatus = "переподключение…"
+            updateRoomLabel()
+            bridge.join(code, myId, myName)
+        }
+    }
+
     override fun onReady() {
         connStatus = "онлайн"
         updateRoomLabel()
@@ -2245,8 +2374,12 @@ class MainActivity : Activity(), SyncBridge.Callback {
                         lastScroll = -1.0
                         pendingCmd = null
                         pickingUntil = 0L
-                        leaveStream()
-                        openRemote(url)
+                        if (liveMode || player != null) {
+                            currentUrl = url // остаёмся на видео главного, пока оно идёт
+                        } else {
+                            leaveStream()
+                            openRemote(url)
+                        }
                     }
                 }
                 "media" -> {
@@ -2257,7 +2390,18 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 }
                 "live" -> {
                     if (!fromOwner(from) || amOwner()) return
-                    if (o.optBoolean("on")) startLive() else stopLive()
+                    if (o.optBoolean("on")) {
+                        startLive()
+                    } else if (liveMode) {
+                        stopLive()
+                    } else if (player != null) {
+                        leaveStream()
+                        if (ownerUrl.startsWith("http")) {
+                            suppressedUrl = ownerUrl
+                            showWeb()
+                            loadAny(ownerUrl)
+                        }
+                    }
                 }
                 "rtc" -> {
                     if (o.optString("to") != myId) return
