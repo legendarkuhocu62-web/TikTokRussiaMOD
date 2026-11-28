@@ -37,10 +37,19 @@
     }
     return out;
   }
+  // На страницах вроде VK лежит несколько одинаковых видео (подгруженные соседние ролики):
+  // выбираем играющее, а если ничего не играет — то, где уже есть воспроизведение.
   function mainVideo() {
-    var vs = allVideos(), best = null, ba = 0;
-    for (var i = 0; i < vs.length; i++) { var a = area(vs[i]); if (a > ba) { ba = a; best = vs[i]; } }
-    return ba >= 6000 ? best : null;
+    var vs = allVideos(), best = null, bs = 0;
+    for (var i = 0; i < vs.length; i++) {
+      var v = vs[i], a = area(v);
+      if (a < 6000) continue;
+      var sc = a;
+      if (!v.paused && !v.ended && v.readyState >= 2) sc += 1e9;
+      else if (v.currentTime > 0) sc += 1e6;
+      if (sc > bs) { bs = sc; best = v; }
+    }
+    return best;
   }
   function relay(msg) {
     var fr = document.getElementsByTagName('iframe');
@@ -74,10 +83,11 @@
         if (!sd.track || sd.track.kind !== 'video') return;
         var p = sd.getParameters();
         if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-        p.encodings[0].maxBitrate = 1500000;
+        p.encodings[0].maxBitrate = 1200000;
         p.encodings[0].maxFramerate = 24;
-        var h = (capVideo && capVideo.videoHeight) || 540;
-        if (h > 540) p.encodings[0].scaleResolutionDownBy = h / 540;
+        var vw = (capVideo && capVideo.videoWidth) || 854, vh = (capVideo && capVideo.videoHeight) || 480;
+        var scale = Math.max(1, vw / 854, vh / 480);
+        if (scale > 1) p.encodings[0].scaleResolutionDownBy = scale;
         sd.setParameters(p).catch(function () {});
         try { sd.track.contentHint = 'motion'; } catch (e) {}
       });
@@ -194,12 +204,16 @@
     return out;
   }
   function mainVideo() {
-    var vs = allVideos(), best = null, ba = 0;
+    var vs = allVideos(), best = null, bs = 0;
     for (var i = 0; i < vs.length; i++) {
-      var a = area(vs[i]);
-      if (a > ba) { ba = a; best = vs[i]; }
+      var v = vs[i], a = area(v);
+      if (a < MIN_AREA) continue;
+      var sc = a;
+      if (!v.paused && !v.ended && v.readyState >= 2) sc += 1e9;
+      else if (v.currentTime > 0) sc += 1e6;
+      if (sc > bs) { bs = sc; best = v; }
     }
-    return ba >= MIN_AREA ? best : null;
+    return best;
   }
 
   function relay(msg) {
@@ -460,7 +474,7 @@
     var vs = document.getElementsByTagName('video'), arr = [];
     for (var i = 0; i < vs.length && i < 5; i++) {
       var v = vs[i], r = v.getBoundingClientRect();
-      arr.push({ w: Math.round(r.width), h: Math.round(r.height), paused: v.paused, rs: v.readyState,
+      arr.push({ w: Math.round(r.width), h: Math.round(r.height), paused: v.paused, rs: v.readyState, ct: Math.round(v.currentTime),
         src: (v.currentSrc || '').slice(0, 50), cors: !!v.crossOrigin });
     }
     var loc = '';

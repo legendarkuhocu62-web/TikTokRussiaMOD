@@ -842,6 +842,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
                 val v = vids.getJSONObject(i)
                 sb.append(" · видео ").append(v.optInt("w")).append("x").append(v.optInt("h"))
                     .append(if (v.optBoolean("paused")) " пауза" else " играет")
+                    .append(" ").append(v.optInt("ct")).append("с")
             }
         }
         if (diagLines.size < 12) diagLines.add(sb.toString())
