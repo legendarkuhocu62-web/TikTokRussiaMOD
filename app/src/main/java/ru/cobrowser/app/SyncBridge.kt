@@ -55,7 +55,10 @@ class SyncBridge(private val activity: Activity, private val cb: Callback) {
     }
 
     private fun eval(js: String) {
-        if (!pageLoaded) pendingJs.add(js) else view.evaluateJavascript(js, null)
+        try {
+            if (!pageLoaded) pendingJs.add(js) else view.evaluateJavascript(js, null)
+        } catch (e: Throwable) {
+        }
     }
 
     fun join(room: String, id: String, name: String) {

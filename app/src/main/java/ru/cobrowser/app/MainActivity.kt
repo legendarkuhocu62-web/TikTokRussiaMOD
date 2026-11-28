@@ -6,6 +6,8 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -225,6 +227,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("cobrowser", MODE_PRIVATE)
+        installCrashReporter()
         favs = Favorites(this)
         val saved = prefs.getString("uid", null)
         if (saved != null) {
@@ -243,6 +246,7 @@ class MainActivity : Activity(), SyncBridge.Callback {
         rootLayout.addView(bridge.view, FrameLayout.LayoutParams(1, 1))
         installScripts()
         showHome()
+        handler.postDelayed({ showLastCrash() }, 600)
     }
 
     override fun onDestroy() {
@@ -684,7 +688,15 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }
 
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                val r = request ?: return null
+                try {
+                    interceptMedia(request)
+                } catch (e: Throwable) {
+                }
+                return null
+            }
+
+            private fun interceptMedia(request: WebResourceRequest?) {
+                val r = request ?: return
                 val url = r.url.toString()
                 val low = url.substringBefore('#').lowercase(Locale.ROOT)
                 val path = low.substringBefore('?')
@@ -697,10 +709,16 @@ class MainActivity : Activity(), SyncBridge.Callback {
                     val org = h?.get("Origin") ?: h?.get("origin")
                     handler.post { onMediaRequest(url, manifest, ref, org) }
                 }
-                return null
             }
 
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                try {
+                    handleVisited(url, isReload)
+                } catch (e: Throwable) {
+                }
+            }
+
+            private fun handleVisited(url: String?, isReload: Boolean) {
                 if (url == null || !url.startsWith("http")) return
                 // служебные адреса нашей страницы с плеером YouTube не считаем переходом
                 if (url.startsWith("https://cobrowser.app")) return
@@ -732,13 +750,16 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                if (!docStartOk) view?.evaluateJavascript(syncJs, null)
-                updateStar()
-                runRole()
-                runPending()
-                if (!amOwner() && lastScroll >= 0) {
-                    applyScroll()
-                    handler.postDelayed({ applyScroll() }, 1200)
+                try {
+                    if (!docStartOk) view?.evaluateJavascript(syncJs, null)
+                    updateStar()
+                    runRole()
+                    runPending()
+                    if (!amOwner() && lastScroll >= 0) {
+                        applyScroll()
+                        handler.postDelayed({ applyScroll() }, 1200)
+                    }
+                } catch (e: Throwable) {
                 }
             }
         }
@@ -824,6 +845,47 @@ class MainActivity : Activity(), SyncBridge.Callback {
             }
         }
         if (diagLines.size < 12) diagLines.add(sb.toString())
+    }
+
+    // Если приложение вылетело, причина сохраняется и показывается при следующем запуске.
+    private fun installCrashReporter() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                val text = "Поток: " + t.name + "\n" + sw.toString()
+                prefs.edit().putString("last_crash", text.take(8000)).commit()
+            } catch (x: Throwable) {
+            }
+            if (prev != null) prev.uncaughtException(t, e)
+        }
+    }
+
+    private fun showLastCrash() {
+        val crash = prefs.getString("last_crash", null) ?: return
+        prefs.edit().remove("last_crash").apply()
+        val tv = TextView(this)
+        tv.text = crash.lines().take(45).joinToString("\n")
+        tv.textSize = 11f
+        tv.typeface = Typeface.MONOSPACE
+        tv.setTextColor(Color.WHITE)
+        tv.setPadding(dp(16), dp(8), dp(16), dp(8))
+        val sv = ScrollView(this)
+        sv.addView(tv)
+        AlertDialog.Builder(this)
+            .setTitle("Приложение вылетело в прошлый раз")
+            .setView(sv)
+            .setPositiveButton("Закрыть", null)
+            .setNeutralButton("Копировать") { _, _ ->
+                try {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("crash", crash))
+                    Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                }
+            }
+            .show()
     }
 
     private fun installScripts() {

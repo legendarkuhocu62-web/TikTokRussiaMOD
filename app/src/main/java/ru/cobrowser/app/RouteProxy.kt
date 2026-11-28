@@ -60,7 +60,12 @@ class RouteProxy(private val ctx: Context, private val isDirect: (String) -> Boo
         if (s != null && !s.isClosed) return s.localPort
         val ss = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
         server = ss
-        pool.execute { acceptLoop(ss) }
+        pool.execute {
+            try {
+                acceptLoop(ss)
+            } catch (t: Throwable) {
+            }
+        }
         return ss.localPort
     }
 
@@ -80,7 +85,13 @@ class RouteProxy(private val ctx: Context, private val isDirect: (String) -> Boo
             } catch (e: Exception) {
                 break
             }
-            pool.execute { handle(c) }
+            pool.execute {
+                try {
+                    handle(c)
+                } catch (t: Throwable) {
+                    closeQuiet(c)
+                }
+            }
         }
     }
 
@@ -152,7 +163,14 @@ class RouteProxy(private val ctx: Context, private val isDirect: (String) -> Boo
                 rout.flush()
             }
             val r = remote
-            pool.execute { pipe(r.getInputStream(), cout, client, r) }
+            pool.execute {
+                try {
+                    pipe(r.getInputStream(), cout, client, r)
+                } catch (t: Throwable) {
+                    closeQuiet(client)
+                    closeQuiet(r)
+                }
+            }
             pipe(cin, r.getOutputStream(), client, r)
         } catch (e: Exception) {
             try {
